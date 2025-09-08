@@ -112,11 +112,15 @@ final class DockerAPIHandler: ChannelInboundHandler {
             "uri": "\(head.uri)"
         ])
 
-        Task {
+        let containerClient = self.containerClient
+        let logger = self.logger
+        
+        Task { @Sendable in
+            let handler = DockerAPIHandler(containerClient: containerClient, logger: logger)
             let response: DockerAPIResponse
             
             do {
-                response = try await routeRequest(head: head, body: body)
+                response = try await handler.routeRequest(head: head, body: body)
             } catch {
                 logger.error("Request failed", metadata: ["error": "\(error)"])
                 response = DockerAPIResponse(
@@ -125,11 +129,11 @@ final class DockerAPIHandler: ChannelInboundHandler {
                 )
             }
 
-            await sendResponse(context: context, response: response)
+            await DockerAPIHandler.sendResponse(context: context, response: response)
         }
     }
 
-    private func routeRequest(head: HTTPRequestHead, body: ByteBuffer) async throws -> DockerAPIResponse {
+    func routeRequest(head: HTTPRequestHead, body: ByteBuffer) async throws -> DockerAPIResponse {
         let components = head.uri.split(separator: "/").map(String.init)
         
         switch (head.method, components) {
@@ -224,7 +228,7 @@ final class DockerAPIHandler: ChannelInboundHandler {
         }
     }
 
-    private func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) async {
+    static func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) async {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: response.contentType)
         
@@ -250,8 +254,8 @@ final class DockerAPIHandler: ChannelInboundHandler {
             status: status,
             body: ["message": message]
         )
-        Task {
-            await sendResponse(context: context, response: response)
+        Task { @Sendable in
+            await DockerAPIHandler.sendResponse(context: context, response: response)
         }
     }
 
