@@ -61,7 +61,7 @@ let package = Package(
         .package(url: "https://github.com/orlandos-nl/DNSClient.git", from: "2.4.1"),
         .package(url: "https://github.com/Bouke/DNS.git", from: "1.2.0"),
         // Note: Containerization dependency commented out due to Swift tools version conflict
-        // .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion)),
+         .package(url: "https://github.com/apple/containerization.git", exact: Version(stringLiteral: scVersion)),
     ],
     targets: [
         .executableTarget(
