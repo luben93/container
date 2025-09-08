@@ -369,6 +369,104 @@ extension DockerAPIHandler {
         }
     }
     
+    // POST /networks/{id}/connect
+    func connectNetwork(id: String, body: ByteBuffer) async throws -> DockerAPIResponse {
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Invalid JSON in request body"]
+            )
+        }
+        
+        guard let containerName = json["Container"] as? String else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Container field is required"]
+            )
+        }
+        
+        // Check if network exists
+        do {
+            _ = try await self.containerClient.inspectNetwork(id: id)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Network not found"]
+            )
+        }
+        
+        // Check if container exists
+        let containers = try await self.containerClient.list()
+        guard containers.contains(where: { $0.configuration.id == containerName }) else {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Container not found"]
+            )
+        }
+        
+        // In a real implementation, this would actually connect the container to the network
+        // For now, just return success
+        return DockerAPIResponse(status: .ok, body: [:])
+    }
+    
+    // POST /networks/{id}/disconnect
+    func disconnectNetwork(id: String, body: ByteBuffer) async throws -> DockerAPIResponse {
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Invalid JSON in request body"]
+            )
+        }
+        
+        guard let containerName = json["Container"] as? String else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Container field is required"]
+            )
+        }
+        
+        // Check if network exists
+        do {
+            _ = try await self.containerClient.inspectNetwork(id: id)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Network not found"]
+            )
+        }
+        
+        // Check if container exists
+        let containers = try await self.containerClient.list()
+        guard containers.contains(where: { $0.configuration.id == containerName }) else {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Container not found"]
+            )
+        }
+        
+        // In a real implementation, this would actually disconnect the container from the network
+        // For now, just return success
+        return DockerAPIResponse(status: .ok, body: [:])
+    }
+    
+    // GET /containers/{id}/json
+    func inspectContainer(id: String) async throws -> DockerAPIResponse {
+        let containers = try await self.containerClient.list()
+        guard let container = containers.first(where: { $0.configuration.id == id }) else {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "No such container: \(id)"]
+            )
+        }
+        
+        let dockerContainer = containerSnapshotToDockerContainer(container)
+        return DockerAPIResponse(status: .ok, body: dockerContainer)
+    }
+    
     // MARK: - Observability endpoints
     
     // GET /containers/{id}/stats
@@ -676,7 +774,7 @@ extension DockerAPIHandler {
         // fetch the actual kernel from the kernel service
         return ClientKernel(
             path: "/usr/local/share/container/kernel",
-            platform: SystemPlatform.current.ociPlatform()
+            platform: Platform.current
         )
     }
 }

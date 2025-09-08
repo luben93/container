@@ -194,6 +194,18 @@ final class DockerAPIHandler: ChannelInboundHandler {
             let id = pathComponents[1]
             return try await removeNetwork(id: id)
             
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "networks" && pathComponents[2] == "connect":
+            let id = pathComponents[1]
+            return try await connectNetwork(id: id, body: body)
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "networks" && pathComponents[2] == "disconnect":
+            let id = pathComponents[1]
+            return try await disconnectNetwork(id: id, body: body)
+            
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "json":
+            let id = pathComponents[1]
+            return try await inspectContainer(id: id)
+            
         // System endpoints
         case (.GET, ["events"]):
             return try await getEvents(query: parseQuery(from: head.uri))
