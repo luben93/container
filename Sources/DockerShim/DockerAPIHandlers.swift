@@ -212,6 +212,219 @@ extension DockerAPIHandler {
             ]
         )
     }
+    
+    // MARK: - Volume endpoints
+    
+    // GET /volumes
+    func listVolumes(query: [String: String]) async throws -> DockerAPIResponse {
+        let volumes = try await self.containerClient.listVolumes()
+        
+        return DockerAPIResponse(
+            status: .ok,
+            body: [
+                "Volumes": volumes,
+                "Warnings": []
+            ]
+        )
+    }
+    
+    // POST /volumes/create
+    func createVolume(body: ByteBuffer) async throws -> DockerAPIResponse {
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Invalid JSON in request body"]
+            )
+        }
+        
+        guard let name = json["Name"] as? String else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Volume name is required"]
+            )
+        }
+        
+        let driver = json["Driver"] as? String ?? "local"
+        let labels = json["Labels"] as? [String: String] ?? [:]
+        let options = json["DriverOpts"] as? [String: String] ?? [:]
+        
+        do {
+            let volume = try await self.containerClient.createVolume(
+                name: name,
+                driver: driver,
+                labels: labels,
+                options: options
+            )
+            return DockerAPIResponse(status: .created, body: volume)
+        } catch {
+            return DockerAPIResponse(
+                status: .conflict,
+                body: ["message": "Volume already exists"]
+            )
+        }
+    }
+    
+    // GET /volumes/{name}
+    func inspectVolume(name: String) async throws -> DockerAPIResponse {
+        do {
+            let volume = try await self.containerClient.inspectVolume(name: name)
+            return DockerAPIResponse(status: .ok, body: volume)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Volume not found"]
+            )
+        }
+    }
+    
+    // DELETE /volumes/{name}
+    func removeVolume(name: String, query: [String: String]) async throws -> DockerAPIResponse {
+        let force = query["force"] == "true" || query["force"] == "1"
+        
+        do {
+            try await self.containerClient.deleteVolume(name: name, force: force)
+            return DockerAPIResponse(status: .noContent)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Volume not found"]
+            )
+        }
+    }
+    
+    // MARK: - Network endpoints
+    
+    // GET /networks
+    func listNetworks(query: [String: String]) async throws -> DockerAPIResponse {
+        let networks = try await self.containerClient.listNetworks()
+        return DockerAPIResponse(status: .ok, body: networks)
+    }
+    
+    // POST /networks/create
+    func createNetwork(body: ByteBuffer) async throws -> DockerAPIResponse {
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Invalid JSON in request body"]
+            )
+        }
+        
+        guard let name = json["Name"] as? String else {
+            return DockerAPIResponse(
+                status: .badRequest,
+                body: ["message": "Network name is required"]
+            )
+        }
+        
+        let driver = json["Driver"] as? String ?? "bridge"
+        let labels = json["Labels"] as? [String: String] ?? [:]
+        let options = json["Options"] as? [String: String] ?? [:]
+        
+        do {
+            let network = try await self.containerClient.createNetwork(
+                name: name,
+                driver: driver,
+                labels: labels,
+                options: options
+            )
+            return DockerAPIResponse(
+                status: .created,
+                body: ["Id": network.Id]
+            )
+        } catch {
+            return DockerAPIResponse(
+                status: .conflict,
+                body: ["message": "Network already exists"]
+            )
+        }
+    }
+    
+    // GET /networks/{id}
+    func inspectNetwork(id: String) async throws -> DockerAPIResponse {
+        do {
+            let network = try await self.containerClient.inspectNetwork(id: id)
+            return DockerAPIResponse(status: .ok, body: network)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Network not found"]
+            )
+        }
+    }
+    
+    // DELETE /networks/{id}
+    func removeNetwork(id: String) async throws -> DockerAPIResponse {
+        do {
+            try await self.containerClient.deleteNetwork(id: id)
+            return DockerAPIResponse(status: .noContent)
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Network not found"]
+            )
+        }
+    }
+    
+    // MARK: - Observability endpoints
+    
+    // GET /containers/{id}/stats
+    func getContainerStats(id: String, query: [String: String]) async throws -> DockerAPIResponse {
+        let stream = query["stream"] != "false" && query["stream"] != "0"
+        
+        do {
+            let stats = try await self.containerClient.getContainerStats(id: id)
+            
+            // For streaming, we'd typically keep the connection open
+            // For now, just return a single stats response
+            return DockerAPIResponse(
+                status: .ok,
+                body: stats,
+                contentType: "application/json"
+            )
+        } catch {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Container not found"]
+            )
+        }
+    }
+    
+    // GET /containers/{id}/top
+    func getContainerProcesses(id: String, query: [String: String]) async throws -> DockerAPIResponse {
+        // Check if container exists
+        let containers = try await self.containerClient.list()
+        guard containers.contains(where: { $0.configuration.id == id }) else {
+            return DockerAPIResponse(
+                status: .notFound,
+                body: ["message": "Container not found"]
+            )
+        }
+        
+        // Mock process list - in real implementation would query actual processes
+        return DockerAPIResponse(
+            status: .ok,
+            body: [
+                "Titles": ["UID", "PID", "PPID", "C", "STIME", "TTY", "TIME", "CMD"],
+                "Processes": [
+                    ["root", "1", "0", "0", "00:00", "?", "00:00:00", "/bin/sh"]
+                ]
+            ]
+        )
+    }
+    
+    // GET /events
+    func getEvents(query: [String: String]) async throws -> DockerAPIResponse {
+        // Mock events endpoint - in real implementation would stream events
+        return DockerAPIResponse(
+            status: .ok,
+            body: [],
+            contentType: "application/json"
+        )
+    }
 }
 
 // Helper functions for data conversion
@@ -237,12 +450,39 @@ extension DockerAPIHandler {
             "State": runtimeStatusToDockerState(container.status),
             "Status": runtimeStatusToDockerStatus(container.status),
             "HostConfig": [
-                "NetworkMode": "default"
+                "NetworkMode": container.configuration.attachedNetworks.first ?? "bridge",
+                "Binds": container.configuration.volumeMounts.map { mount in
+                    "\(mount.source):\(mount.destination):\(mount.mode)"
+                }
             ],
             "NetworkSettings": [
-                "Networks": [:]
+                "Networks": Dictionary(uniqueKeysWithValues: container.configuration.attachedNetworks.map { networkName in
+                    (networkName, [
+                        "IPAMConfig": nil as Any?,
+                        "Links": nil as Any?,
+                        "Aliases": nil as Any?,
+                        "NetworkID": "network-\(networkName)",
+                        "EndpointID": "",
+                        "Gateway": "172.17.0.1",
+                        "IPAddress": "",
+                        "IPPrefixLen": 16,
+                        "IPv6Gateway": "",
+                        "GlobalIPv6Address": "",
+                        "GlobalIPv6PrefixLen": 0,
+                        "MacAddress": ""
+                    ])
+                })
             ],
-            "Mounts": []
+            "Mounts": container.configuration.volumeMounts.map { mount in
+                [
+                    "Type": mount.type,
+                    "Source": mount.source,
+                    "Destination": mount.destination,
+                    "Mode": mount.mode,
+                    "RW": mount.mode.contains("rw"),
+                    "Propagation": ""
+                ]
+            }
         ]
     }
     
@@ -321,6 +561,21 @@ extension DockerAPIHandler {
             config.publishedPorts = extractPublishedPorts(from: exposedPorts)
         }
         
+        // Extract volume mounts
+        config.volumeMounts = extractVolumeMounts(from: json)
+        
+        // Extract network mode
+        if let hostConfig = json["HostConfig"] as? [String: Any],
+           let networkMode = hostConfig["NetworkMode"] as? String {
+            if networkMode != "default" && networkMode != "bridge" {
+                config.attachedNetworks = [networkMode]
+            } else {
+                config.attachedNetworks = ["bridge"] // Default network
+            }
+        } else {
+            config.attachedNetworks = ["bridge"] // Default network
+        }
+        
         return config
     }
     
@@ -355,6 +610,65 @@ extension DockerAPIHandler {
         }
         
         return ports
+    }
+    
+    private func extractVolumeMounts(from json: [String: Any]) -> [DockerVolumeMount] {
+        var mounts: [DockerVolumeMount] = []
+        
+        // Extract from Volumes field
+        if let volumes = json["Volumes"] as? [String: Any] {
+            for (destination, _) in volumes {
+                mounts.append(DockerVolumeMount(
+                    source: "",  // Anonymous volume
+                    destination: destination,
+                    mode: "rw",
+                    type: "volume"
+                ))
+            }
+        }
+        
+        // Extract from HostConfig.Binds
+        if let hostConfig = json["HostConfig"] as? [String: Any],
+           let binds = hostConfig["Binds"] as? [String] {
+            for bind in binds {
+                let parts = bind.split(separator: ":")
+                if parts.count >= 2 {
+                    let source = String(parts[0])
+                    let destination = String(parts[1])
+                    let mode = parts.count > 2 ? String(parts[2]) : "rw"
+                    
+                    let mountType = source.hasPrefix("/") ? "bind" : "volume"
+                    mounts.append(DockerVolumeMount(
+                        source: source,
+                        destination: destination,
+                        mode: mode,
+                        type: mountType
+                    ))
+                }
+            }
+        }
+        
+        // Extract from HostConfig.Mounts
+        if let hostConfig = json["HostConfig"] as? [String: Any],
+           let mountsArray = hostConfig["Mounts"] as? [[String: Any]] {
+            for mountDict in mountsArray {
+                if let source = mountDict["Source"] as? String,
+                   let target = mountDict["Target"] as? String {
+                    let type = mountDict["Type"] as? String ?? "volume"
+                    let readOnly = mountDict["ReadOnly"] as? Bool ?? false
+                    let mode = readOnly ? "ro" : "rw"
+                    
+                    mounts.append(DockerVolumeMount(
+                        source: source,
+                        destination: target,
+                        mode: mode,
+                        type: type
+                    ))
+                }
+            }
+        }
+        
+        return mounts
     }
     
     private func getMockKernel() -> ClientKernel {

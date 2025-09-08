@@ -133,6 +133,7 @@ final class DockerAPIHandler: ChannelInboundHandler {
         let components = head.uri.split(separator: "/").map(String.init)
         
         switch (head.method, components) {
+        // Container endpoints
         case (.GET, ["containers", "json"]):
             return try await listContainers(query: parseQuery(from: head.uri))
             
@@ -154,6 +155,48 @@ final class DockerAPIHandler: ChannelInboundHandler {
         case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "logs":
             let id = pathComponents[1]
             return try await getContainerLogs(id: id, query: parseQuery(from: head.uri))
+            
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "stats":
+            let id = pathComponents[1]
+            return try await getContainerStats(id: id, query: parseQuery(from: head.uri))
+            
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "top":
+            let id = pathComponents[1]
+            return try await getContainerProcesses(id: id, query: parseQuery(from: head.uri))
+            
+        // Volume endpoints
+        case (.GET, ["volumes"]):
+            return try await listVolumes(query: parseQuery(from: head.uri))
+            
+        case (.POST, ["volumes", "create"]):
+            return try await createVolume(body: body)
+            
+        case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "volumes":
+            let name = pathComponents[1]
+            return try await inspectVolume(name: name)
+            
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "volumes":
+            let name = pathComponents[1]
+            return try await removeVolume(name: name, query: parseQuery(from: head.uri))
+            
+        // Network endpoints
+        case (.GET, ["networks"]):
+            return try await listNetworks(query: parseQuery(from: head.uri))
+            
+        case (.POST, ["networks", "create"]):
+            return try await createNetwork(body: body)
+            
+        case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "networks":
+            let id = pathComponents[1]
+            return try await inspectNetwork(id: id)
+            
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "networks":
+            let id = pathComponents[1]
+            return try await removeNetwork(id: id)
+            
+        // System endpoints
+        case (.GET, ["events"]):
+            return try await getEvents(query: parseQuery(from: head.uri))
             
         case (.GET, ["version"]):
             return getVersion()
