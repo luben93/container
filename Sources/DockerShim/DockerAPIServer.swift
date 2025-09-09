@@ -370,11 +370,7 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         let isUpgrade = response.status == .switchingProtocols
         let bodyData = response.bodyData ?? Data()
 
-        if !isUpgrade {
-            headers.add(name: "Content-Type", value: response.contentType)
-            headers.add(name: "Content-Length", value: "\(bodyData.count)")
-            headers.add(name: "Connection", value: "close")
-        } else {
+        if isUpgrade {
             // For upgrade, ensure required headers; omit length & content-type per upgrade expectations.
             if !response.additionalHeaders.contains(where: { $0.0.lowercased() == "connection" }) {
                 headers.add(name: "Connection", value: "Upgrade")
@@ -382,6 +378,15 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             if !response.additionalHeaders.contains(where: { $0.0.lowercased() == "upgrade" }) {
                 headers.add(name: "Upgrade", value: "tcp")
             }
+        } else if response.streamer != nil {
+            // Streaming response (non-upgrade): use chunked transfer and keep-alive
+            headers.add(name: "Content-Type", value: response.contentType)
+            headers.add(name: "Transfer-Encoding", value: "chunked")
+            headers.add(name: "Connection", value: "keep-alive")
+        } else {
+            headers.add(name: "Content-Type", value: response.contentType)
+            headers.add(name: "Content-Length", value: "\(bodyData.count)")
+            headers.add(name: "Connection", value: "close")
         }
         for (k,v) in response.additionalHeaders { headers.add(name: k, value: v) }
 
@@ -395,15 +400,17 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         }
 
         if let streamer = response.streamer {
-            // Remove HTTP handlers to write raw bytes
             let channel = context.channel
-            channel.pipeline.context(handlerType: HTTPResponseEncoder.self).whenSuccess { ctx in
-                _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+            if isUpgrade {
+                // Hijack connection for raw streaming
+                channel.pipeline.context(handlerType: HTTPResponseEncoder.self).whenSuccess { ctx in
+                    _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+                }
+                channel.pipeline.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self).whenSuccess { ctx in
+                    _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+                }
             }
-            channel.pipeline.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self).whenSuccess { ctx in
-                _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
-            }
-            // Run streamer directly (already on event loop)
+            // Run streamer directly
             streamer(channel)
         } else if !isUpgrade {
             context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)

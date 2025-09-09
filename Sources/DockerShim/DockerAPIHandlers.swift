@@ -35,25 +35,35 @@ extension DockerAPIHandler {
             return DockerAPIResponse(status: .ok, body: [] as [[String: Any]])
         }
     }
-    }
     
     // POST /containers/create
     func createContainer(body: ByteBuffer, query: [String: String]) async throws -> DockerAPIResponse {
         var mutableBody = body
         guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
-              let _ = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
             return DockerAPIResponse(
                 status: .badRequest,
                 body: ["message": "Invalid JSON in request body"]
             )
         }
-        
-        // Extract container name from query parameter
-        let containerName = query["name"] ?? UUID().uuidString
-        
-        // For now, return success without actually creating container
-        // This allows Docker client to work even when backend is unavailable
-        return DockerAPIResponse(status: .created, body: ["Id": containerName, "Warnings": []])
+
+        // Container name (Docker allows optional name in query)
+        let containerName = Utility.createContainerID(name: query["name"])
+
+        do {
+            // Translate Docker create JSON to ContainerConfiguration + Kernel
+            let (config, kernel) = try await dockerCreateRequestToContainerConfiguration(json, name: containerName)
+
+            // Create the container via runtime
+            _ = try await ClientContainer.create(configuration: config, kernel: kernel)
+
+            return DockerAPIResponse(status: .created, body: ["Id": containerName, "Warnings": []])
+        } catch {
+            return DockerAPIResponse(
+                status: .internalServerError,
+                body: ["message": "Failed to create container: \(error)"]
+            )
+        }
     }
     
     // POST /containers/{id}/start
@@ -500,42 +510,19 @@ extension DockerAPIHandler {
     
     // GET /events
     func getEvents(query: [String: String]) async throws -> DockerAPIResponse {
-        // Stream events - for now return empty but with proper content type
-        // In a real implementation, this would be a streaming response
-        _ = query["since"]
-        _ = query["until"]
-        _ = query["filters"]
-        
-        // For Docker Compose and clients, return an empty event stream
-        // This prevents tools from hanging waiting for events
-        let events = [
-            [
-                "Type": "container",
-                "Action": "start",
-                "Actor": [
-                    "ID": "placeholder-container-id",
-                    "Attributes": [
-                        "image": "hello-world",
-                        "name": "placeholder-container"
-                    ]
-                ],
-                "time": Int(Date().timeIntervalSince1970),
-                "timeNano": Int(Date().timeIntervalSince1970 * 1_000_000_000)
-            ]
-        ]
-        
-        // Return as newline-delimited JSON (Docker events format)
-        let eventLines = events.compactMap { event in
-            guard let data = try? JSONSerialization.data(withJSONObject: event),
-                  let line = String(data: data, encoding: .utf8) else { return nil }
-            return line
-        }.joined(separator: "\n")
-        
-        return DockerAPIResponse(
-            status: .ok,
-            body: eventLines,
-            contentType: "application/json"
-        )
+        // Provide a streaming response and keep the connection open to avoid EOF
+        // on clients that expect long polling for events.
+        let streamer: (Channel) -> Void = { channel in
+            // Keep connection open and send chunked heartbeats
+            let task = channel.eventLoop.scheduleRepeatedTask(initialDelay: .seconds(30), delay: .seconds(30)) { _ in
+                var buf = channel.allocator.buffer(capacity: 1)
+                buf.writeString("\n")
+                let part = HTTPServerResponsePart.body(.byteBuffer(buf))
+                channel.writeAndFlush(NIOAny(part), promise: nil)
+            }
+            channel.closeFuture.whenComplete { _ in task.cancel() }
+        }
+        return DockerAPIResponse(status: .ok, body: nil, contentType: "application/json", streamer: streamer)
     }
 
     // POST /images/create
@@ -593,8 +580,27 @@ extension DockerAPIHandler {
     }
     
     func killContainer(id: String, query: [String: String]) async throws -> DockerAPIResponse {
-        _ = query["signal"] ?? "KILL"  // Ignore signal for now
-        return DockerAPIResponse(status: .noContent)
+        let signalName = (query["signal"] ?? "KILL").uppercased()
+        let signal: Int32 = {
+            switch signalName {
+            case "HUP": return SIGHUP
+            case "INT": return SIGINT
+            case "QUIT": return SIGQUIT
+            case "ILL": return SIGILL
+            case "ABRT": return SIGABRT
+            case "KILL": return SIGKILL
+            case "ALRM": return SIGALRM
+            case "TERM": return SIGTERM
+            default: return SIGKILL
+            }
+        }()
+        do {
+            let c = try await ClientContainer.get(id: id)
+            try await c.kill(signal)
+            return DockerAPIResponse(status: .noContent)
+        } catch {
+            return DockerAPIResponse(status: .notFound, body: ["message": "No such container: \(id)"])
+        }
     }
     
     func pauseContainer(id: String) async throws -> DockerAPIResponse {
@@ -697,57 +703,115 @@ extension DockerAPIHandler {
     }
     
     // MARK: - Secrets (Docker Compose)
-    
+
     func listSecrets(query: [String: String]) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .ok, body: [] as [[String: Any]])
-    }
-    
-    func createSecret(body: ByteBuffer) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .created, body: ["ID": UUID().uuidString])
-    }
-    
-    func inspectSecret(id: String) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .ok, body: [
-            "ID": id,
-            "Version": ["Index": 1],
-            "CreatedAt": "2025-01-01T00:00:00Z",
-            "UpdatedAt": "2025-01-01T00:00:00Z",
-            "Spec": [
-                "Name": id,
-                "Labels": [:] as [String: String]
+        let list = try await SecretStore.shared.list()
+        let mapped: [[String: Any]] = list.map { s in
+            [
+                "ID": s.id,
+                "Version": ["Index": 1],
+                "CreatedAt": ISO8601DateFormatter().string(from: s.createdAt),
+                "UpdatedAt": ISO8601DateFormatter().string(from: s.updatedAt),
+                "Spec": [
+                    "Name": s.name,
+                    "Labels": s.labels
+                ] as [String: Any]
             ]
-        ])
+        }
+        return DockerAPIResponse(status: .ok, body: mapped)
     }
-    
+
+    func createSecret(body: ByteBuffer) async throws -> DockerAPIResponse {
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let name = json["Name"] as? String else {
+            return DockerAPIResponse(status: .badRequest, body: ["message": "Invalid secret payload"])
+        }
+        let labels = json["Labels"] as? [String: String] ?? [:]
+        let dataB64 = json["Data"] as? String
+        let data = dataB64.flatMap { Data(base64Encoded: $0) } ?? Data()
+
+        let created = try await SecretStore.shared.create(name: name, data: data, labels: labels)
+        return DockerAPIResponse(status: .created, body: ["ID": created.id])
+    }
+
+    func inspectSecret(id: String) async throws -> DockerAPIResponse {
+        guard let s = try await SecretStore.shared.get(id: id) else {
+            return DockerAPIResponse(status: .notFound, body: ["message": "secret not found"])
+        }
+        let body: [String: Any] = [
+            "ID": s.id,
+            "Version": ["Index": 1],
+            "CreatedAt": ISO8601DateFormatter().string(from: s.createdAt),
+            "UpdatedAt": ISO8601DateFormatter().string(from: s.updatedAt),
+            "Spec": [
+                "Name": s.name,
+                "Labels": s.labels
+            ]
+        ]
+        return DockerAPIResponse(status: .ok, body: body)
+    }
+
     func removeSecret(id: String) async throws -> DockerAPIResponse {
+        try await SecretStore.shared.delete(id: id)
         return DockerAPIResponse(status: .noContent)
     }
     
     // MARK: - Configs (Docker Compose)
     
     func listConfigs(query: [String: String]) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .ok, body: [] as [[String: Any]])
+        let list = try await ConfigStore.shared.list()
+        let mapped: [[String: Any]] = list.map { c in
+            [
+                "ID": c.id,
+                "Version": ["Index": 1],
+                "CreatedAt": ISO8601DateFormatter().string(from: c.createdAt),
+                "UpdatedAt": ISO8601DateFormatter().string(from: c.updatedAt),
+                "Spec": [
+                    "Name": c.name,
+                    "Labels": c.labels
+                ] as [String: Any]
+            ]
+        }
+        return DockerAPIResponse(status: .ok, body: mapped)
     }
-    
+
     func createConfig(body: ByteBuffer) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .created, body: ["ID": UUID().uuidString])
+        var mutableBody = body
+        guard let bodyData = mutableBody.readData(length: mutableBody.readableBytes),
+              let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any],
+              let name = json["Name"] as? String else {
+            return DockerAPIResponse(status: .badRequest, body: ["message": "Invalid config payload"])
+        }
+        let labels = json["Labels"] as? [String: String] ?? [:]
+        let dataB64 = json["Data"] as? String
+        let data = dataB64.flatMap { Data(base64Encoded: $0) } ?? Data()
+
+        let created = try await ConfigStore.shared.create(name: name, data: data, labels: labels)
+        return DockerAPIResponse(status: .created, body: ["ID": created])
     }
-    
+
     func inspectConfig(id: String) async throws -> DockerAPIResponse {
-        return DockerAPIResponse(status: .ok, body: [
+        guard let c = try await ConfigStore.shared.get(id: id) else {
+            return DockerAPIResponse(status: .notFound, body: ["message": "config not found"])
+        }
+        let body: [String: Any] = [
             "ID": id,
             "Version": ["Index": 1],
-            "CreatedAt": "2025-01-01T00:00:00Z",
-            "UpdatedAt": "2025-01-01T00:00:00Z",
+            "CreatedAt": ISO8601DateFormatter().string(from: c.createdAt),
+            "UpdatedAt": ISO8601DateFormatter().string(from: c.updatedAt),
             "Spec": [
-                "Name": id,
-                "Labels": [:] as [String: String],
-                "Data": ""
+                "Name": c.name,
+                "Labels": c.labels,
+                "Data": c.data.base64EncodedString()
             ]
-        ])
+        ]
+        return DockerAPIResponse(status: .ok, body: body)
     }
-    
+
     func removeConfig(id: String) async throws -> DockerAPIResponse {
+        try await ConfigStore.shared.delete(id: id)
         return DockerAPIResponse(status: .noContent)
     }
     
@@ -788,6 +852,8 @@ extension DockerAPIHandler {
             "Warnings": [] as [String]
         ])
     }
+
+}
 
 // Helper functions for data conversion
 extension DockerAPIHandler {
@@ -1080,22 +1146,104 @@ extension DockerAPIHandler {
               let json = try JSONSerialization.jsonObject(with: bodyData) as? [String: Any] else {
             return DockerAPIResponse(status: .badRequest, body: ["message": "Invalid JSON"])
         }
-        
-        // Extract exec configuration  
-        _ = (json["Cmd"] as? [String]) ?? ["/bin/sh"]
-        _ = (json["AttachStdout"] as? Bool) ?? true
-        _ = (json["AttachStderr"] as? Bool) ?? true
-        _ = (json["AttachStdin"] as? Bool) ?? false
-        
-        // For now, return a placeholder exec ID
+
+        let cmd = (json["Cmd"] as? [String]) ?? ["/bin/sh"]
+        let attachStdout = (json["AttachStdout"] as? Bool) ?? true
+        let attachStderr = (json["AttachStderr"] as? Bool) ?? true
+        let attachStdin = (json["AttachStdin"] as? Bool) ?? false
+        let tty = (json["Tty"] as? Bool) ?? false
+        let env = (json["Env"] as? [String]) ?? []
+
+        let spec = ExecSpec(containerID: id, cmd: cmd, env: env, tty: tty, attachStdin: attachStdin, attachStdout: attachStdout, attachStderr: attachStderr)
         let execId = UUID().uuidString
+        await ExecStore.shared.set(spec: spec, for: execId)
         return DockerAPIResponse(status: .created, body: ["Id": execId])
     }
-    
+
     func startExec(execId: String, body: ByteBuffer) async throws -> DockerAPIResponse {
-        // Exec start - this would need to actually run the command in the container
-        // For now, return success but don't actually execute
-        return DockerAPIResponse(status: .ok, body: nil)
+        // Streaming hijack with multiplexed raw-stream
+        guard let spec = await ExecStore.shared.get(id: execId) else {
+            return DockerAPIResponse(status: .notFound, body: ["message": "exec not found"])
+        }
+
+        // Prepare stdio pipes
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+
+        let streamer: (Channel) -> Void = { channel in
+            // Install inbound handler to forward bytes to stdin
+            channel.pipeline.addHandler(ExecInboundHandler(writeHandle: stdinPipe.fileHandleForWriting)).whenComplete { _ in }
+
+            Task {
+                do {
+                    // Resolve container
+                    let container = try await ClientContainer.get(id: spec.containerID)
+
+                    // Build process configuration
+                    let pc = ProcessConfiguration(
+                        executable: spec.cmd.first ?? "/bin/sh",
+                        arguments: Array(spec.cmd.dropFirst()),
+                        environment: spec.env,
+                        workingDirectory: "/"
+                    )
+
+                    let proc = try await container.createProcess(
+                        id: UUID().uuidString,
+                        configuration: pc,
+                        stdio: [spec.attachStdin ? stdinPipe.fileHandleForReading : nil,
+                                spec.attachStdout ? stdoutPipe.fileHandleForWriting : nil,
+                                spec.attachStderr ? stderrPipe.fileHandleForWriting : nil]
+                    )
+
+                    try await proc.start()
+
+                    // Stream stdout/stderr to channel in docker raw-stream frames
+                    let writeFrame: @Sendable (UInt8, Data) -> Void = { streamType, data in
+                        var buf = ByteBufferAllocator().buffer(capacity: 8 + data.count)
+                        buf.writeInteger(streamType)
+                        buf.writeInteger(UInt8(0))
+                        buf.writeInteger(UInt8(0))
+                        buf.writeInteger(UInt8(0))
+                        buf.writeInteger(UInt32(data.count).bigEndian)
+                        buf.writeBytes(data)
+                        channel.writeAndFlush(NIOAny(buf), promise: nil)
+                    }
+
+                    // Readers using readabilityHandler for pipes
+                    stdoutPipe.fileHandleForReading.readabilityHandler = { fh in
+                        let data = fh.availableData
+                        if data.isEmpty {
+                            fh.readabilityHandler = nil
+                        } else {
+                            writeFrame(1, data)
+                        }
+                    }
+                    stderrPipe.fileHandleForReading.readabilityHandler = { fh in
+                        let data = fh.availableData
+                        if data.isEmpty {
+                            fh.readabilityHandler = nil
+                        } else {
+                            writeFrame(2, data)
+                        }
+                    }
+
+                    _ = try? await proc.wait()
+                } catch {
+                    // Ignore streaming errors
+                }
+                // Close channel after short delay
+                channel.eventLoop.scheduleTask(in: .milliseconds(100)) { channel.close(promise: nil) }
+            }
+        }
+
+        return DockerAPIResponse(
+            status: .switchingProtocols,
+            body: nil,
+            contentType: "application/vnd.docker.raw-stream",
+            additionalHeaders: [("Connection", "Upgrade"), ("Upgrade", "tcp")],
+            streamer: streamer
+        )
     }
     
     // Container attach endpoint
@@ -1103,22 +1251,23 @@ extension DockerAPIHandler {
         let attachStdout = query["stdout"] != "0"
         let attachStderr = query["stderr"] != "0"
         let wantLogs = (query["logs"] == "1" || query["logs"] == "true")
-        let streaming = query["stream"] != "0" // future real-time follow
+        let follow = query["stream"] != "0" // follow/stream by default
 
         guard let container = try? await ClientContainer.get(id: id) else {
             return DockerAPIResponse(status: .notFound, body: ["message": "No such container: \(id)"])
         }
 
-        // Snapshot logs if requested.
-        var stdoutData = Data(); var stderrData = Data()
-        if wantLogs, let handles = try? await container.logs() {
-            if attachStdout, handles.indices.contains(0) { stdoutData = handles[0].readDataToEndOfFile() }
-            if attachStderr, handles.indices.contains(1) { stderrData = handles[1].readDataToEndOfFile() }
+        // Acquire log file handles (stdout, stderr)
+        let logHandles = try? await container.logs()
+        var initialStdout = Data(); var initialStderr = Data()
+        if wantLogs, let handles = logHandles {
+            if attachStdout, handles.indices.contains(0) { initialStdout = handles[0].readDataToEndOfFile() }
+            if attachStderr, handles.indices.contains(1) { initialStderr = handles[1].readDataToEndOfFile() }
         }
 
-        func makeFrame(streamType: UInt8, payload: Data) -> ByteBuffer {
+        let makeFrame: @Sendable (UInt8, Data) -> ByteBuffer = { streamType, payload in
             var buf = ByteBufferAllocator().buffer(capacity: 8 + payload.count)
-            buf.writeInteger(streamType)              // stream
+            buf.writeInteger(streamType)
             buf.writeInteger(UInt8(0))
             buf.writeInteger(UInt8(0))
             buf.writeInteger(UInt8(0))
@@ -1128,17 +1277,47 @@ extension DockerAPIHandler {
         }
 
         let streamer: (Channel) -> Void = { channel in
-            if attachStdout && !stdoutData.isEmpty {
-                let frameBuf = makeFrame(streamType: 1, payload: stdoutData)
-                channel.write(NIOAny(frameBuf), promise: nil)
+            // Write any initial logs
+            if attachStdout && !initialStdout.isEmpty {
+                channel.write(NIOAny(makeFrame(1, initialStdout)), promise: nil)
             }
-            if attachStderr && !stderrData.isEmpty {
-                let frameBuf = makeFrame(streamType: 2, payload: stderrData)
-                channel.write(NIOAny(frameBuf), promise: nil)
+            if attachStderr && !initialStderr.isEmpty {
+                channel.write(NIOAny(makeFrame(2, initialStderr)), promise: nil)
             }
             channel.flush()
-            // If we had real-time streaming we'd keep reading; for now close after short delay.
-            channel.eventLoop.scheduleTask(in: .milliseconds(150)) { channel.close(promise: nil) }
+
+            guard follow, let handles = logHandles else {
+                // No follow requested; close soon after delivering initial logs
+                channel.eventLoop.scheduleTask(in: .milliseconds(100)) { channel.close(promise: nil) }
+                return
+            }
+
+            // Follow mode: stream new bytes from log files
+            if attachStdout, handles.indices.contains(0) {
+                let fh = handles[0]
+                fh.readabilityHandler = { h in
+                    let data = h.availableData
+                    if data.isEmpty { h.readabilityHandler = nil; return }
+                    var buf = makeFrame(1, data)
+                    channel.writeAndFlush(NIOAny(buf), promise: nil)
+                }
+            }
+            if attachStderr, handles.indices.contains(1) {
+                let fh = handles[1]
+                fh.readabilityHandler = { h in
+                    let data = h.availableData
+                    if data.isEmpty { h.readabilityHandler = nil; return }
+                    var buf = makeFrame(2, data)
+                    channel.writeAndFlush(NIOAny(buf), promise: nil)
+                }
+            }
+
+            channel.closeFuture.whenComplete { _ in
+                // Cleanup handlers when client detaches
+                if let handles = logHandles {
+                    handles.forEach { $0.readabilityHandler = nil }
+                }
+            }
         }
 
         return DockerAPIResponse(
@@ -1146,7 +1325,7 @@ extension DockerAPIHandler {
             body: nil,
             contentType: "application/vnd.docker.raw-stream",
             additionalHeaders: [("Connection", "Upgrade"), ("Upgrade", "tcp")],
-            streamer: streaming ? streamer : nil
+            streamer: streamer
         )
     }
     
