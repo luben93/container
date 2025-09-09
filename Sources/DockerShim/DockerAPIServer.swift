@@ -1,18 +1,3 @@
-//===----------------------------------------------------------------------===//
-// Copyright © 2025 Apple Inc. and the container project authors. All rights reserved.
-//
-// Licensed under the Apache License, Version 2.0 (the "License");
-// you may not use this file except in compliance with the License.
-// You may obtain a copy of the License at
-//
-//   https://www.apache.org/licenses/LICENSE-2.0
-//
-// Unless required by applicable law or agreed to in writing, software
-// distributed under the License is distributed on an "AS IS" BASIS,
-// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-// See the License for the specific language governing permissions and
-// limitations under the License.
-//===----------------------------------------------------------------------===//
 
 import Foundation
 import Logging
@@ -112,7 +97,7 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         let unsafeSelf = UnsafeSendable(self)
         let unsafeChannel = UnsafeSendable(context.channel)
         let headCopy = head
-        var bodyCopy = body
+        let bodyCopy = body
         Task {
             let response: DockerAPIResponse
             do {
@@ -141,6 +126,9 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             components.removeFirst()
         }
         
+        // Log the request for debugging
+        print("🔍 Docker API Request: \(head.method) \(head.uri) -> components: \(components)")
+        
         switch (head.method, components) {
         // Container endpoints
         case (.GET, ["containers", "json"]):
@@ -156,6 +144,26 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "stop":
             let id = pathComponents[1]
             return try await stopContainer(id: id, query: parseQuery(from: head.uri))
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "restart":
+            let id = pathComponents[1]
+            return try await restartContainer(id: id, query: parseQuery(from: head.uri))
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "kill":
+            let id = pathComponents[1]
+            return try await killContainer(id: id, query: parseQuery(from: head.uri))
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "pause":
+            let id = pathComponents[1]
+            return try await pauseContainer(id: id)
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "unpause":
+            let id = pathComponents[1]
+            return try await unpauseContainer(id: id)
+            
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "wait":
+            let id = pathComponents[1]
+            return try await waitContainer(id: id)
             
         case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "containers":
             let id = pathComponents[1]
@@ -173,7 +181,7 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             let id = pathComponents[1]
             return try await getContainerProcesses(id: id, query: parseQuery(from: head.uri))
             
-        // Volume endpoints
+        // Volume endpoints  
         case (.GET, ["volumes"]):
             return try await listVolumes(query: parseQuery(from: head.uri))
             
@@ -187,6 +195,9 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "volumes":
             let name = pathComponents[1]
             return try await removeVolume(name: name, query: parseQuery(from: head.uri))
+        
+        case (.POST, ["volumes", "prune"]):
+            return try await pruneVolumes(query: parseQuery(from: head.uri))
             
         // Network endpoints
         case (.GET, ["networks"]):
@@ -203,6 +214,9 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             let id = pathComponents[1]
             return try await removeNetwork(id: id)
         
+        case (.POST, ["networks", "prune"]):
+            return try await pruneNetworks(query: parseQuery(from: head.uri))
+        
         // Network connect/disconnect endpoints
         case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "networks" && pathComponents[2] == "connect":
             let id = pathComponents[1]
@@ -216,6 +230,48 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             return try await imagesCreate(head: head, query: parseQuery(from: head.uri))
         case (.GET, ["images", "json"]):
             return try await imagesList()
+        case (.POST, ["build"]):
+            return try await buildImage(head: head, body: body, query: parseQuery(from: head.uri))
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "images":
+            let name = pathComponents[1]
+            return try await removeImage(name: name, query: parseQuery(from: head.uri))
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "images" && pathComponents[2] == "json":
+            let name = pathComponents[1]
+            return try await inspectImage(name: name)
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "images" && pathComponents[2] == "history":
+            let name = pathComponents[1]
+            return try await getImageHistory(name: name)
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "images" && pathComponents[2] == "tag":
+            let name = pathComponents[1]
+            return try await tagImage(name: name, query: parseQuery(from: head.uri))
+        case (.POST, ["images", "prune"]):
+            return try await pruneImages(query: parseQuery(from: head.uri))
+        case (.GET, let pathComponents) where pathComponents.count == 4 && pathComponents[0] == "images" && pathComponents[2] == "get":
+            let name = pathComponents[1]
+            return try await exportImages(names: [name])
+        case (.POST, ["images", "load"]):
+            return try await loadImages(body: body)
+        case (.POST, ["images", "search"]):
+            return try await searchImages(query: parseQuery(from: head.uri))
+        
+        // Registry and distribution endpoints
+        case (.GET, let pathComponents) where pathComponents.count >= 3 && pathComponents[0] == "distribution" && pathComponents[2] == "json":
+            let name = pathComponents[1]
+            return try await getDistributionInfo(name: name)
+        
+        // Container exec endpoints
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "exec":
+            let id = pathComponents[1]
+            return try await createExec(id: id, body: body)
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "exec" && pathComponents[2] == "start":
+            let execId = pathComponents[1]
+            return try await startExec(execId: execId, body: body)
+        
+        // Container attach endpoint
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "attach":
+            let id = pathComponents[1]
+            return try await attachContainer(id: id, query: parseQuery(from: head.uri))
+        
         // System endpoints
         case (.GET, ["events"]):
             return try await getEvents(query: parseQuery(from: head.uri))
@@ -223,8 +279,76 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         case (.GET, ["version"]):
             return getVersion()
         
+        case (.GET, ["info"]):
+            return getSystemInfo()
+        
         case (.GET, ["_ping"]):
             return DockerAPIResponse(status: .ok, body: "OK")
+        
+        case (.HEAD, ["_ping"]):
+            return DockerAPIResponse(status: .ok, body: "")
+        
+        case (.POST, ["auth"]):
+            return DockerAPIResponse(status: .ok, body: ["Status": "Login Succeeded"])
+        
+        case (.GET, ["system", "df"]):
+            return getSystemUsage()
+        
+        case (.POST, ["system", "prune"]):
+            return try await pruneSystem(query: parseQuery(from: head.uri))
+        
+        // Session and config endpoints
+        case (.POST, ["session"]):
+            return try await createSession(body: body)
+        
+        // Secrets endpoints (for Docker Compose)
+        case (.GET, ["secrets"]):
+            return try await listSecrets(query: parseQuery(from: head.uri))
+        
+        case (.POST, ["secrets", "create"]):
+            return try await createSecret(body: body)
+        
+        case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "secrets":
+            let id = pathComponents[1]
+            return try await inspectSecret(id: id)
+        
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "secrets":
+            let id = pathComponents[1]
+            return try await removeSecret(id: id)
+        
+        // Configs endpoints (for Docker Compose)
+        case (.GET, ["configs"]):
+            return try await listConfigs(query: parseQuery(from: head.uri))
+        
+        case (.POST, ["configs", "create"]):
+            return try await createConfig(body: body)
+        
+        case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "configs":
+            let id = pathComponents[1]
+            return try await inspectConfig(id: id)
+        
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "configs":
+            let id = pathComponents[1]
+            return try await removeConfig(id: id)
+        
+        // Services endpoints (for Docker Compose with swarm mode)
+        case (.GET, ["services"]):
+            return try await listServices(query: parseQuery(from: head.uri))
+        
+        case (.POST, ["services", "create"]):
+            return try await createService(body: body)
+        
+        case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "services":
+            let id = pathComponents[1]
+            return try await inspectService(id: id)
+        
+        case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "services":
+            let id = pathComponents[1]
+            return try await removeService(id: id)
+        
+        case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "services" && pathComponents[2] == "update":
+            let id = pathComponents[1]
+            return try await updateService(id: id, body: body)
         
         // Container inspect endpoint
         case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "json":
@@ -232,6 +356,8 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             return try await inspectContainer(id: id)
         
         default:
+            // Log unhandled requests
+            print("🚫 Unhandled Docker API Request: \(head.method) \(head.uri) -> components: \(components)")
             return DockerAPIResponse(
                 status: .notFound,
                 body: ["message": "Not found"]
@@ -243,6 +369,15 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: response.contentType)
         
+        // Get response body data
+        let bodyData = response.bodyData ?? Data()
+        
+        // Set Content-Length to avoid chunked encoding
+        headers.add(name: "Content-Length", value: "\(bodyData.count)")
+        
+        // Add connection close header to ensure proper connection handling
+        headers.add(name: "Connection", value: "close")
+        
         let responseHead = HTTPResponseHead(
             version: .http1_1,
             status: response.status,
@@ -251,12 +386,13 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         
         context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
         
-        if let bodyData = response.bodyData {
+        if !bodyData.isEmpty {
             var buffer = context.channel.allocator.buffer(capacity: bodyData.count)
             buffer.writeBytes(bodyData)
             context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
         }
         
+        // Send the response without auto-closing
         context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
     }
 
