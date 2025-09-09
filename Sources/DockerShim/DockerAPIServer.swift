@@ -367,33 +367,50 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
 
     private func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) {
         var headers = HTTPHeaders()
-        headers.add(name: "Content-Type", value: response.contentType)
-        
-        // Get response body data
+        let isUpgrade = response.status == .switchingProtocols
         let bodyData = response.bodyData ?? Data()
-        
-        // Set Content-Length to avoid chunked encoding
-        headers.add(name: "Content-Length", value: "\(bodyData.count)")
-        
-        // Add connection close header to ensure proper connection handling
-        headers.add(name: "Connection", value: "close")
-        
-        let responseHead = HTTPResponseHead(
-            version: .http1_1,
-            status: response.status,
-            headers: headers
-        )
-        
+
+        if !isUpgrade {
+            headers.add(name: "Content-Type", value: response.contentType)
+            headers.add(name: "Content-Length", value: "\(bodyData.count)")
+            headers.add(name: "Connection", value: "close")
+        } else {
+            // For upgrade, ensure required headers; omit length & content-type per upgrade expectations.
+            if !response.additionalHeaders.contains(where: { $0.0.lowercased() == "connection" }) {
+                headers.add(name: "Connection", value: "Upgrade")
+            }
+            if !response.additionalHeaders.contains(where: { $0.0.lowercased() == "upgrade" }) {
+                headers.add(name: "Upgrade", value: "tcp")
+            }
+        }
+        for (k,v) in response.additionalHeaders { headers.add(name: k, value: v) }
+
+        let responseHead = HTTPResponseHead(version: .http1_1, status: response.status, headers: headers)
         context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
-        
+
         if !bodyData.isEmpty {
             var buffer = context.channel.allocator.buffer(capacity: bodyData.count)
             buffer.writeBytes(bodyData)
             context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
         }
-        
-        // Send the response without auto-closing
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+
+        if let streamer = response.streamer {
+            // Remove HTTP handlers to write raw bytes
+            let channel = context.channel
+            channel.pipeline.context(handlerType: HTTPResponseEncoder.self).whenSuccess { ctx in
+                _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+            }
+            channel.pipeline.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self).whenSuccess { ctx in
+                _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+            }
+            // Run streamer directly (already on event loop)
+            streamer(channel)
+        } else if !isUpgrade {
+            context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+        } else {
+            let channel = context.channel
+            channel.eventLoop.scheduleTask(in: .milliseconds(150)) { channel.close(promise: nil) }
+        }
     }
 
     private func sendError(context: ChannelHandlerContext, status: HTTPResponseStatus, message: String) {
@@ -422,11 +439,15 @@ struct DockerAPIResponse: @unchecked Sendable {
     let status: HTTPResponseStatus
     let body: Any?
     let contentType: String
-    
-    init(status: HTTPResponseStatus, body: Any? = nil, contentType: String = "application/json") {
+    let additionalHeaders: [(String,String)]
+    let streamer: ((Channel) -> Void)?
+
+    init(status: HTTPResponseStatus, body: Any? = nil, contentType: String = "application/json", additionalHeaders: [(String,String)] = [], streamer: ((Channel) -> Void)? = nil) {
         self.status = status
         self.body = body
         self.contentType = contentType
+        self.additionalHeaders = additionalHeaders
+        self.streamer = streamer
     }
     
     var bodyData: Data? {
