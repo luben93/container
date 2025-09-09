@@ -113,6 +113,11 @@ let package = Package(
                 .product(name: "NIOPosix", package: "swift-nio"),
                 .product(name: "NIOHTTP1", package: "swift-nio"),
                 .product(name: "NIOFoundationCompat", package: "swift-nio"),
+                // Integrate with runtime services (no mocks)
+                "ContainerClient",
+                "ContainerNetworkService",
+                .product(name: "Containerization", package: "containerization"),
+                .product(name: "ContainerizationOCI", package: "containerization"),
             ],
             path: "Sources/DockerShim"
         ),

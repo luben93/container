@@ -20,18 +20,17 @@ import NIOCore
 import NIOPosix
 import NIOHTTP1
 import NIOFoundationCompat
+import ContainerClient
 
-final class DockerAPIServer {
+final class DockerAPIServer: @unchecked Sendable {
     private let host: String
     private let port: Int
     private let logger: Logger
-    private let containerClient: ContainerClientInterface
     
     init(host: String, port: Int, logger: Logger) {
         self.host = host
         self.port = port
         self.logger = logger
-        self.containerClient = ContainerClientFactory.create()
     }
 
     func start() async throws {
@@ -44,7 +43,7 @@ final class DockerAPIServer {
                 channel.pipeline.addHandlers([
                     HTTPResponseEncoder(),
                     ByteToMessageHandler(HTTPRequestDecoder(leftOverBytesStrategy: .dropBytes)),
-                    DockerAPIHandler(containerClient: self.containerClient, logger: self.logger)
+                    DockerAPIHandler(logger: self.logger)
                 ])
             }
             .childChannelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
@@ -70,17 +69,15 @@ final class DockerAPIServer {
     }
 }
 
-final class DockerAPIHandler: ChannelInboundHandler {
+final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
     typealias InboundIn = HTTPServerRequestPart
     typealias OutboundOut = HTTPServerResponsePart
 
-    internal let containerClient: ContainerClientInterface
     private let logger: Logger
     private var head: HTTPRequestHead?
     private var body = ByteBuffer()
 
-    init(containerClient: ContainerClientInterface, logger: Logger) {
-        self.containerClient = containerClient
+    init(logger: Logger) {
         self.logger = logger
     }
 
@@ -112,25 +109,37 @@ final class DockerAPIHandler: ChannelInboundHandler {
             "uri": "\(head.uri)"
         ])
 
+        let unsafeSelf = UnsafeSendable(self)
+        let unsafeChannel = UnsafeSendable(context.channel)
+        let headCopy = head
+        var bodyCopy = body
         Task {
             let response: DockerAPIResponse
-            
             do {
-                response = try await routeRequest(head: head, body: body)
+                response = try await unsafeSelf.value.routeRequest(head: headCopy, body: bodyCopy)
             } catch {
-                logger.error("Request failed", metadata: ["error": "\(error)"])
+                unsafeSelf.value.logger.error("Request failed", metadata: ["error": "\(error)"])
                 response = DockerAPIResponse(
                     status: .internalServerError,
                     body: ["message": "Internal server error"]
                 )
             }
-
-            await sendResponse(context: context, response: response)
+            unsafeChannel.value.eventLoop.execute {
+                unsafeChannel.value.pipeline.context(handlerType: DockerAPIHandler.self).whenSuccess { handlerContext in
+                    unsafeSelf.value.sendResponse(context: handlerContext, response: response)
+                }
+            }
         }
     }
 
     private func routeRequest(head: HTTPRequestHead, body: ByteBuffer) async throws -> DockerAPIResponse {
-        let components = head.uri.split(separator: "/").map(String.init)
+        // Extract path without query and normalize components
+        let rawPath = String(head.uri.split(separator: "?", maxSplits: 1).first ?? Substring(head.uri))
+        var components = rawPath.split(separator: "/").map(String.init)
+        // Drop optional version prefix like /v1.43
+        if let first = components.first, first.hasPrefix("v"), first.dropFirst().contains(".") {
+            components.removeFirst()
+        }
         
         switch (head.method, components) {
         // Container endpoints
@@ -182,40 +191,46 @@ final class DockerAPIHandler: ChannelInboundHandler {
         // Network endpoints
         case (.GET, ["networks"]):
             return try await listNetworks(query: parseQuery(from: head.uri))
-            
+        
         case (.POST, ["networks", "create"]):
             return try await createNetwork(body: body)
-            
+        
         case (.GET, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "networks":
             let id = pathComponents[1]
             return try await inspectNetwork(id: id)
-            
+        
         case (.DELETE, let pathComponents) where pathComponents.count == 2 && pathComponents[0] == "networks":
             let id = pathComponents[1]
             return try await removeNetwork(id: id)
-            
+        
+        // Network connect/disconnect endpoints
         case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "networks" && pathComponents[2] == "connect":
             let id = pathComponents[1]
             return try await connectNetwork(id: id, body: body)
-            
         case (.POST, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "networks" && pathComponents[2] == "disconnect":
             let id = pathComponents[1]
             return try await disconnectNetwork(id: id, body: body)
-            
-        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "json":
-            let id = pathComponents[1]
-            return try await inspectContainer(id: id)
-            
+
+        // Image endpoints
+        case (.POST, ["images", "create"]):
+            return try await imagesCreate(head: head, query: parseQuery(from: head.uri))
+        case (.GET, ["images", "json"]):
+            return try await imagesList()
         // System endpoints
         case (.GET, ["events"]):
             return try await getEvents(query: parseQuery(from: head.uri))
-            
+        
         case (.GET, ["version"]):
             return getVersion()
-            
+        
         case (.GET, ["_ping"]):
             return DockerAPIResponse(status: .ok, body: "OK")
-            
+        
+        // Container inspect endpoint
+        case (.GET, let pathComponents) where pathComponents.count == 3 && pathComponents[0] == "containers" && pathComponents[2] == "json":
+            let id = pathComponents[1]
+            return try await inspectContainer(id: id)
+        
         default:
             return DockerAPIResponse(
                 status: .notFound,
@@ -224,7 +239,7 @@ final class DockerAPIHandler: ChannelInboundHandler {
         }
     }
 
-    private func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) async {
+    private func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: response.contentType)
         
@@ -250,14 +265,11 @@ final class DockerAPIHandler: ChannelInboundHandler {
             status: status,
             body: ["message": message]
         )
-        Task {
-            await sendResponse(context: context, response: response)
-        }
+        sendResponse(context: context, response: response)
     }
 
     private func parseQuery(from uri: String) -> [String: String] {
-        guard let url = URL(string: uri),
-              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+        guard let components = URLComponents(string: uri),
               let queryItems = components.queryItems else {
             return [:]
         }
@@ -284,14 +296,22 @@ struct DockerAPIResponse: @unchecked Sendable {
     var bodyData: Data? {
         guard let body = body else { return nil }
         
-        if let string = body as? String {
-            return string.data(using: .utf8)
+        // Return raw bytes or text as-is
+        if let data = body as? Data { return data }
+        if let string = body as? String { return string.data(using: .utf8) }
+        
+        // Prefer property list JSON when valid
+        if JSONSerialization.isValidJSONObject(body) {
+            return try? JSONSerialization.data(withJSONObject: body)
         }
         
-        do {
-            return try JSONSerialization.data(withJSONObject: body)
-        } catch {
-            return nil
+        // Fallback: attempt to encode Encodable types
+        if let encodable = body as? any Encodable {
+            let encoder = JSONEncoder()
+            encoder.outputFormatting = [.sortedKeys]
+            return try? encoder.encode(AnyEncodable(encodable))
         }
+        
+        return nil
     }
 }

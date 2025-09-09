@@ -1,0 +1,130 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug native-builder-demo",
+            "program": "${workspaceFolder:container}/.build/debug/native-builder-demo",
+            "preLaunchTask": "swift: Build Debug native-builder-demo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release native-builder-demo",
+            "program": "${workspaceFolder:container}/.build/release/native-builder-demo",
+            "preLaunchTask": "swift: Build Release native-builder-demo"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container-runtime-linux",
+            "program": "${workspaceFolder:container}/.build/debug/container-runtime-linux",
+            "preLaunchTask": "swift: Build Debug container-runtime-linux"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container-runtime-linux",
+            "program": "${workspaceFolder:container}/.build/release/container-runtime-linux",
+            "preLaunchTask": "swift: Build Release container-runtime-linux"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container-network-vmnet",
+            "program": "${workspaceFolder:container}/.build/debug/container-network-vmnet",
+            "preLaunchTask": "swift: Build Debug container-network-vmnet"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container-network-vmnet",
+            "program": "${workspaceFolder:container}/.build/release/container-network-vmnet",
+            "preLaunchTask": "swift: Build Release container-network-vmnet"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container-docker-shim",
+            "program": "${workspaceFolder:container}/.build/debug/container-docker-shim",
+            "preLaunchTask": "swift: Build Debug container-docker-shim"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container-docker-shim",
+            "program": "${workspaceFolder:container}/.build/release/container-docker-shim",
+            "preLaunchTask": "swift: Build Release container-docker-shim"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container-core-images",
+            "program": "${workspaceFolder:container}/.build/debug/container-core-images",
+            "preLaunchTask": "swift: Build Debug container-core-images"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container-core-images",
+            "program": "${workspaceFolder:container}/.build/release/container-core-images",
+            "preLaunchTask": "swift: Build Release container-core-images"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container-apiserver",
+            "program": "${workspaceFolder:container}/.build/debug/container-apiserver",
+            "preLaunchTask": "swift: Build Debug container-apiserver"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container-apiserver",
+            "program": "${workspaceFolder:container}/.build/release/container-apiserver",
+            "preLaunchTask": "swift: Build Release container-apiserver"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Debug container",
+            "program": "${workspaceFolder:container}/.build/debug/container",
+            "preLaunchTask": "swift: Build Debug container"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:container}",
+            "name": "Release container",
+            "program": "${workspaceFolder:container}/.build/release/container",
+            "preLaunchTask": "swift: Build Release container"
+        }
+    ]
+}
