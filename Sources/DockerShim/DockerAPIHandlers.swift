@@ -3,6 +3,7 @@ import Foundation
 import NIOHTTP1
 import NIOFoundationCompat
 import NIOCore
+import NIOPosix
 import ContainerClient
 import ContainerNetworkService
 import Containerization
@@ -74,6 +75,16 @@ extension DockerAPIHandler {
             let stdinPipe = shouldAttachStdin ? Pipe() : nil
             let stdoutPipe = shouldAttachStdout ? Pipe() : nil
             let stderrPipe = shouldAttachStderr ? Pipe() : nil
+            
+            // Make pipes non-blocking for real-time streaming
+            if let stdout = stdoutPipe {
+                let flags = fcntl(stdout.fileHandleForReading.fileDescriptor, F_GETFL)
+                _ = fcntl(stdout.fileHandleForReading.fileDescriptor, F_SETFL, flags | O_NONBLOCK)
+            }
+            if let stderr = stderrPipe {
+                let flags = fcntl(stderr.fileHandleForReading.fileDescriptor, F_GETFL)
+                _ = fcntl(stderr.fileHandleForReading.fileDescriptor, F_SETFL, flags | O_NONBLOCK)
+            }
             
             // Store pipes for potential attach operations
             if let stdout = stdoutPipe, let stderr = stderrPipe {
@@ -1344,6 +1355,14 @@ extension DockerAPIHandler {
             return buf
         }
 
+        // Store attach configuration for when the container starts
+        ContainerAttachStore.shared.setAttachConfig(
+            containerId: id,
+            attachStdout: attachStdout,
+            attachStderr: attachStderr,
+            attachStdin: false // Docker CLI doesn't send stdin during run
+        )
+
         let streamer: @Sendable (Channel) -> Void = { channel in
             Task {
                 // Send existing logs if requested
@@ -1367,54 +1386,161 @@ extension DockerAPIHandler {
                 }
                 
                 if follow {
-                    // Set up polling for new log content
-                    var lastStdoutSize = 0
-                    var lastStderrSize = 0
+                    // Wait for the start command to create pipes
+                    print("🔗 Waiting for container \(id) to start and create pipes...")
                     
-                    let pollTask = Task {
-                        while !Task.isCancelled {
-                            try await Task.sleep(for: .milliseconds(100))
+                    let pipes = await ContainerAttachStore.shared.waitForPipes(containerId: id)
+                    
+                    if let pipes = pipes {
+                        print("🔗 Got pipes for container \(id), setting up DispatchSource forwarding")
+                        
+                        var sources: [DispatchSourceRead] = []
+                        
+                        // Set up stdout forwarding
+                        if attachStdout, let stdout = pipes.stdout {
+                            let fd = stdout.fileHandleForReading.fileDescriptor
+                            let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: DispatchQueue.global())
                             
-                            if let logHandles = try? await container.logs() {
-                                // Check for new stdout content
-                                if attachStdout && logHandles.indices.contains(0) {
-                                    let handle = logHandles[0]
-                                    handle.seek(toFileOffset: UInt64(lastStdoutSize))
-                                    let newData = handle.readDataToEndOfFile()
-                                    if !newData.isEmpty {
-                                        let frame = makeFrame(1, newData)
-                                        channel.writeAndFlush(frame, promise: nil)
-                                        lastStdoutSize += newData.count
+                            source.setEventHandler {
+                                let data = stdout.fileHandleForReading.availableData
+                                if !data.isEmpty {
+                                    let frame = makeFrame(1, data)
+                                    channel.writeAndFlush(frame, promise: nil)
+                                }
+                            }
+                            
+                            source.setCancelHandler {
+                                stdout.fileHandleForReading.closeFile()
+                            }
+                            
+                            source.resume()
+                            sources.append(source)
+                        }
+                        
+                        // Set up stderr forwarding  
+                        if attachStderr, let stderr = pipes.stderr {
+                            let fd = stderr.fileHandleForReading.fileDescriptor
+                            let source = DispatchSource.makeReadSource(fileDescriptor: fd, queue: DispatchQueue.global())
+                            
+                            source.setEventHandler {
+                                let data = stderr.fileHandleForReading.availableData
+                                if !data.isEmpty {
+                                    let frame = makeFrame(2, data)
+                                    channel.writeAndFlush(frame, promise: nil)
+                                }
+                            }
+                            
+                            source.setCancelHandler {
+                                stderr.fileHandleForReading.closeFile()
+                            }
+                            
+                            source.resume()
+                            sources.append(source)
+                        }
+                        
+                        // Monitor container status
+                        let monitorTask = Task {
+                            while !Task.isCancelled {
+                                try? await Task.sleep(for: .milliseconds(500))
+                                if let updatedContainer = try? await ClientContainer.get(id: id),
+                                   updatedContainer.status != .running {
+                                    print("🏁 Container \(id) stopped")
+                                    // Container stopped - Docker CLI will detect EOF and close
+                                    break
+                                }
+                            }
+                        }
+                        
+                        // Clean up when channel closes
+                        let capturedSources = sources
+                        channel.closeFuture.whenComplete { _ in
+                            print("🔌 Channel closed for \(id)")
+                            for source in capturedSources {
+                                source.cancel()
+                            }
+                            monitorTask.cancel()
+                            ContainerAttachStore.shared.removePipes(containerId: id)
+                            ContainerAttachStore.shared.removeAttachConfig(containerId: id)
+                        }
+                        
+                        // Keep the connection alive until Docker CLI closes it
+                        try? await channel.closeFuture.get()
+                        monitorTask.cancel()
+                    } else {
+                        print("⚠️  No live pipes available for \(id), falling back to log polling")
+                        // No live pipes available, fall back to faster polling
+                        var lastStdoutSize = 0
+                        var lastStderrSize = 0
+                        
+                        let pollTask = Task {
+                            while !Task.isCancelled {
+                                try await Task.sleep(for: .milliseconds(10)) // Very fast polling
+                                
+                                if let logHandles = try? await container.logs() {
+                                    // Check for new stdout content
+                                    if attachStdout && logHandles.indices.contains(0) {
+                                        let handle = logHandles[0]
+                                        handle.seek(toFileOffset: UInt64(lastStdoutSize))
+                                        let newData = handle.readDataToEndOfFile()
+                                        if !newData.isEmpty {
+                                            let frame = makeFrame(1, newData)
+                                            channel.writeAndFlush(frame, promise: nil)
+                                            lastStdoutSize += newData.count
+                                        }
+                                    }
+                                    
+                                    // Check for new stderr content
+                                    if attachStderr && logHandles.indices.contains(1) {
+                                        let handle = logHandles[1]
+                                        handle.seek(toFileOffset: UInt64(lastStderrSize))
+                                        let newData = handle.readDataToEndOfFile()
+                                        if !newData.isEmpty {
+                                            let frame = makeFrame(2, newData)
+                                            channel.writeAndFlush(frame, promise: nil)
+                                            lastStderrSize += newData.count
+                                        }
                                     }
                                 }
                                 
-                                // Check for new stderr content
-                                if attachStderr && logHandles.indices.contains(1) {
-                                    let handle = logHandles[1]
-                                    handle.seek(toFileOffset: UInt64(lastStderrSize))
-                                    let newData = handle.readDataToEndOfFile()
-                                    if !newData.isEmpty {
-                                        let frame = makeFrame(2, newData)
-                                        channel.writeAndFlush(frame, promise: nil)
-                                        lastStderrSize += newData.count
+                                // Check if container has stopped
+                                if let updatedContainer = try? await ClientContainer.get(id: id),
+                                   updatedContainer.status != .running {
+                                    // Container stopped, send final logs and close
+                                    try await Task.sleep(for: .milliseconds(100))
+                                    
+                                    // Send any remaining content
+                                    if let logHandles = try? await container.logs() {
+                                        if attachStdout && logHandles.indices.contains(0) {
+                                            let handle = logHandles[0]
+                                            handle.seek(toFileOffset: UInt64(lastStdoutSize))
+                                            let finalData = handle.readDataToEndOfFile()
+                                            if !finalData.isEmpty {
+                                                let frame = makeFrame(1, finalData)
+                                                channel.writeAndFlush(frame, promise: nil)
+                                            }
+                                        }
+                                        
+                                        if attachStderr && logHandles.indices.contains(1) {
+                                            let handle = logHandles[1]
+                                            handle.seek(toFileOffset: UInt64(lastStderrSize))
+                                            let finalData = handle.readDataToEndOfFile()
+                                            if !finalData.isEmpty {
+                                                let frame = makeFrame(2, finalData)
+                                                channel.writeAndFlush(frame, promise: nil)
+                                            }
+                                        }
                                     }
+                                    
+                                    channel.close(promise: nil)
+                                    break
                                 }
                             }
-                            
-                            // Check if container has stopped
-                            if let updatedContainer = try? await ClientContainer.get(id: id),
-                               updatedContainer.status != .running {
-                                // Container stopped, send final logs and close
-                                try await Task.sleep(for: .milliseconds(500))
-                                channel.close(promise: nil)
-                                break
-                            }
                         }
-                    }
-                    
-                    // Cancel polling when channel closes
-                    channel.closeFuture.whenComplete { _ in
-                        pollTask.cancel()
+                        
+                        // Cancel polling when channel closes
+                        channel.closeFuture.whenComplete { _ in
+                            pollTask.cancel()
+                        }
                     }
                 } else {
                     // Not following, just close after sending existing logs
