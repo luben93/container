@@ -112,24 +112,43 @@ final class DockerAPIHandler: ChannelInboundHandler {
             "uri": "\(head.uri)"
         ])
 
+        // Handle the request asynchronously without capturing context in @Sendable closure
         let containerClient = self.containerClient
         let logger = self.logger
         
-        Task { @Sendable in
-            let handler = DockerAPIHandler(containerClient: containerClient, logger: logger)
-            let response: DockerAPIResponse
-            
+        // Create a new handler instance for this request
+        let handler = DockerAPIHandler(containerClient: containerClient, logger: logger)
+        
+        // Execute the async work and then send response
+        let eventLoop = context.eventLoop
+        let promise = eventLoop.makePromise(of: DockerAPIResponse.self)
+        
+        Task {
             do {
-                response = try await handler.routeRequest(head: head, body: body)
+                let response = try await handler.routeRequest(head: head, body: body)
+                promise.succeed(response)
             } catch {
                 logger.error("Request failed", metadata: ["error": "\(error)"])
-                response = DockerAPIResponse(
+                let errorResponse = DockerAPIResponse(
                     status: .internalServerError,
                     body: ["message": "Internal server error"]
                 )
+                promise.succeed(errorResponse)
             }
-
-            await DockerAPIHandler.sendResponse(context: context, response: response)
+        }
+        
+        promise.futureResult.whenComplete { result in
+            switch result {
+            case .success(let response):
+                self.sendResponseSync(context: context, response: response)
+            case .failure(let error):
+                logger.error("Failed to handle request", metadata: ["error": "\(error)"])
+                let errorResponse = DockerAPIResponse(
+                    status: .internalServerError,
+                    body: ["message": "Internal server error"]
+                )
+                self.sendResponseSync(context: context, response: errorResponse)
+            }
         }
     }
 
@@ -228,6 +247,27 @@ final class DockerAPIHandler: ChannelInboundHandler {
         }
     }
 
+    private func sendResponseSync(context: ChannelHandlerContext, response: DockerAPIResponse) {
+        var headers = HTTPHeaders()
+        headers.add(name: "Content-Type", value: response.contentType)
+        
+        let responseHead = HTTPResponseHead(
+            version: .http1_1,
+            status: response.status,
+            headers: headers
+        )
+        
+        context.write(wrapOutboundOut(.head(responseHead)), promise: nil)
+        
+        if let bodyData = response.bodyData {
+            var buffer = context.channel.allocator.buffer(capacity: bodyData.count)
+            buffer.writeBytes(bodyData)
+            context.write(wrapOutboundOut(.body(.byteBuffer(buffer))), promise: nil)
+        }
+        
+        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
+    }
+    
     static func sendResponse(context: ChannelHandlerContext, response: DockerAPIResponse) async {
         var headers = HTTPHeaders()
         headers.add(name: "Content-Type", value: response.contentType)
@@ -254,9 +294,7 @@ final class DockerAPIHandler: ChannelInboundHandler {
             status: status,
             body: ["message": message]
         )
-        Task { @Sendable in
-            await DockerAPIHandler.sendResponse(context: context, response: response)
-        }
+        sendResponseSync(context: context, response: response)
     }
 
     private func parseQuery(from uri: String) -> [String: String] {
