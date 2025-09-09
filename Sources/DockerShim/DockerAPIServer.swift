@@ -288,6 +288,9 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         case (.HEAD, ["_ping"]):
             return DockerAPIResponse(status: .ok, body: "")
         
+        case (.GET, ["events"]):
+            return try await getEvents(query: parseQuery(from: head.uri))
+        
         case (.POST, ["auth"]):
             return DockerAPIResponse(status: .notImplemented, body: ["message": "Authentication not yet implemented"])
         

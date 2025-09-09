@@ -63,8 +63,37 @@ extension DockerAPIHandler {
     func startContainer(id: String) async throws -> DockerAPIResponse {
         do {
             let container = try await ClientContainer.get(id: id)
-            let proc = try await container.bootstrap(stdio: [nil, nil, nil])
+            
+            // Check if this container has attach configuration
+            let attachConfig = ContainerAttachStore.shared.getAttachConfig(containerId: id)
+            let shouldAttachStdout = attachConfig?.attachStdout ?? false
+            let shouldAttachStderr = attachConfig?.attachStderr ?? false
+            let shouldAttachStdin = attachConfig?.attachStdin ?? false
+            
+            // Create stdio pipes based on attach configuration
+            let stdinPipe = shouldAttachStdin ? Pipe() : nil
+            let stdoutPipe = shouldAttachStdout ? Pipe() : nil
+            let stderrPipe = shouldAttachStderr ? Pipe() : nil
+            
+            // Store pipes for potential attach operations
+            if let stdout = stdoutPipe, let stderr = stderrPipe {
+                ContainerAttachStore.shared.setPipes(containerId: id, stdout: stdout, stderr: stderr)
+            }
+            
+            let stdio: [FileHandle?] = [
+                stdinPipe?.fileHandleForReading,
+                stdoutPipe?.fileHandleForWriting,
+                stderrPipe?.fileHandleForWriting
+            ]
+            
+            let proc = try await container.bootstrap(stdio: stdio)
             try await proc.start()
+            
+            // For containers with stdout/stderr attached, we need to handle the output
+            // In Docker's behavior, when you run "docker run hello-world", the output
+            // is immediately streamed back. However, since this is just the start endpoint,
+            // we don't stream here. The output will be available via logs endpoint.
+            
             return DockerAPIResponse(status: .noContent)
         } catch {
             return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to start container: \(error)"])
@@ -95,6 +124,11 @@ extension DockerAPIHandler {
         do {
             let c = try await ClientContainer.get(id: id)
             try await c.delete(force: force)
+            
+            // Clean up attach store
+            ContainerAttachStore.shared.removePipes(containerId: id)
+            ContainerAttachStore.shared.removeAttachConfig(containerId: id)
+            
             return DockerAPIResponse(status: .noContent)
         } catch {
             return DockerAPIResponse(
@@ -110,21 +144,42 @@ extension DockerAPIHandler {
             let c = try await ClientContainer.get(id: id)
             let logHandles = try await c.logs()
             
-            // For simplicity, we'll read the logs and return them as text
-            // In a full implementation, this would stream the logs properly
-            var logContent = ""
+            // Create a buffer to hold the Docker raw stream format
+            var buffer = ByteBufferAllocator().buffer(capacity: 1024)
             
-            for handle in logHandles {
-                let data = handle.readDataToEndOfFile()
-                if let content = String(data: data, encoding: .utf8) {
-                    logContent += content
+            // Read stdout (if available) - typically index 0
+            if logHandles.indices.contains(0) {
+                let stdoutData = logHandles[0].readDataToEndOfFile()
+                if !stdoutData.isEmpty {
+                    // Docker raw stream format: [STREAM_TYPE][0x00][0x00][0x00][SIZE1][SIZE2][SIZE3][SIZE4][PAYLOAD]
+                    buffer.writeInteger(UInt8(1))  // stdout
+                    buffer.writeInteger(UInt8(0))
+                    buffer.writeInteger(UInt8(0))
+                    buffer.writeInteger(UInt8(0))
+                    let size = UInt32(stdoutData.count)
+                    buffer.writeInteger(size, endianness: .big)
+                    buffer.writeBytes(stdoutData)
+                }
+            }
+            
+            // Read stderr (if available) - typically index 1
+            if logHandles.indices.contains(1) {
+                let stderrData = logHandles[1].readDataToEndOfFile()
+                if !stderrData.isEmpty {
+                    buffer.writeInteger(UInt8(2))  // stderr
+                    buffer.writeInteger(UInt8(0))
+                    buffer.writeInteger(UInt8(0))
+                    buffer.writeInteger(UInt8(0))
+                    let size = UInt32(stderrData.count)
+                    buffer.writeInteger(size, endianness: .big)
+                    buffer.writeBytes(stderrData)
                 }
             }
             
             return DockerAPIResponse(
                 status: .ok,
-                body: logContent,
-                contentType: "text/plain"
+                body: Data(buffer.readableBytesView),
+                contentType: "application/vnd.docker.raw-stream"
             )
             
         } catch {
@@ -932,22 +987,61 @@ extension DockerAPIHandler {
             image = pulled.description
         }
         
-        // Extract command and args
-        var processPath = "/bin/sh"
+        // Extract attach flags - these determine if we need to capture stdio
+        let attachStdout = (json["AttachStdout"] as? Bool) ?? true
+        let attachStderr = (json["AttachStderr"] as? Bool) ?? true
+        let attachStdin = (json["AttachStdin"] as? Bool) ?? false
+        
+        // Store attach configuration for use during container start
+        ContainerAttachStore.shared.setAttachConfig(
+            containerId: name,
+            attachStdout: attachStdout,
+            attachStderr: attachStderr,
+            attachStdin: attachStdin
+        )
+        
+        // Extract command and args - use image defaults if not provided in request
+        var processPath: String
         var processArgs: [String] = []
         
+        // Get the image configuration to access cmd and entrypoint
+        let clientImage = ClientImage(description: image)
+        let imageConfig = try await clientImage.config(for: .current).config
+        
+        // Check if Cmd is provided in the request
         if let cmd = json["Cmd"] as? [String], !cmd.isEmpty {
             processPath = cmd[0]
             processArgs = Array(cmd.dropFirst())
+        } else {
+            // Use image's default Cmd
+            if let config = imageConfig, let imageCmd = config.cmd, !imageCmd.isEmpty {
+                processPath = imageCmd[0]
+                processArgs = Array(imageCmd.dropFirst())
+            } else {
+                processPath = "/bin/sh"
+            }
         }
         
-        // Extract entrypoint
+        // Check if Entrypoint is provided in the request
         if let entrypoint = json["Entrypoint"] as? [String], !entrypoint.isEmpty {
             processPath = entrypoint[0]
             if let cmd = json["Cmd"] as? [String] {
                 processArgs = Array(entrypoint.dropFirst()) + cmd
+            } else if let config = imageConfig, let imageCmd = config.cmd {
+                // Use entrypoint from request + cmd from image
+                processArgs = Array(entrypoint.dropFirst()) + imageCmd
             } else {
                 processArgs = Array(entrypoint.dropFirst())
+            }
+        } else if let config = imageConfig, let imageEntrypoint = config.entrypoint, !imageEntrypoint.isEmpty {
+            // Use image's default entrypoint
+            processPath = imageEntrypoint[0]
+            if let cmd = json["Cmd"] as? [String] {
+                processArgs = Array(imageEntrypoint.dropFirst()) + cmd
+            } else if let imageCmd = config.cmd {
+                processArgs = Array(imageEntrypoint.dropFirst()) + imageCmd
+            } else {
+                processArgs = Array(imageEntrypoint.dropFirst())
             }
         }
         
@@ -1244,7 +1338,8 @@ extension DockerAPIHandler {
             buf.writeInteger(UInt8(0))
             buf.writeInteger(UInt8(0))
             buf.writeInteger(UInt8(0))
-            buf.writeInteger(UInt32(payload.count).bigEndian)
+            let size = UInt32(payload.count)
+            buf.writeInteger(size, endianness: .big)
             buf.writeBytes(payload)
             return buf
         }
