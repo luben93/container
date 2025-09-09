@@ -283,10 +283,32 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             return getSystemInfo()
         
         case (.GET, ["_ping"]):
-            return DockerAPIResponse(status: .ok, body: "OK")
+            return DockerAPIResponse(
+                status: .ok, 
+                body: "OK",
+                contentType: "text/plain",
+                additionalHeaders: [
+                    ("Api-Version", "1.41"),
+                    ("Builder-Version", "1.0.0"), 
+                    ("Docker-Experimental", "false"),
+                    ("Cache-Control", "no-cache, no-store, must-revalidate"),
+                    ("Pragma", "no-cache")
+                ]
+            )
         
         case (.HEAD, ["_ping"]):
-            return DockerAPIResponse(status: .ok, body: "")
+            return DockerAPIResponse(
+                status: .ok, 
+                body: "",
+                contentType: "text/plain",
+                additionalHeaders: [
+                    ("Api-Version", "1.41"),
+                    ("Builder-Version", "1.0.0"),
+                    ("Docker-Experimental", "false"), 
+                    ("Cache-Control", "no-cache, no-store, must-revalidate"),
+                    ("Pragma", "no-cache")
+                ]
+            )
         
         case (.GET, ["events"]):
             return try await getEvents(query: parseQuery(from: head.uri))

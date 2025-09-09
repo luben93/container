@@ -65,18 +65,74 @@ extension DockerAPIHandler {
         do {
             let container = try await ClientContainer.get(id: id)
             
-            // Check if this container has attach configuration
+            // Publish container start event
+            EventsStore.shared.publishContainerEvent(
+                containerId: id,
+                action: "start",
+                attributes: [
+                    "name": id,
+                    "image": "hello-world"
+                ]
+            )
+            
+            // Always start the container normally with default stdio
+            // This ensures logs are written to files as usual
+            let proc = try await container.bootstrap(stdio: [nil, nil, nil])
+            try await proc.start()
+            
+            // Monitor for container exit to publish stop/die events
+            Task {
+                do {
+                    let exitCode = try await proc.wait()
+                    
+                    // Publish container die event
+                    EventsStore.shared.publishContainerEvent(
+                        containerId: id,
+                        action: "die",
+                        attributes: [
+                            "name": id,
+                            "image": "hello-world",
+                            "exitCode": "\(exitCode)"
+                        ]
+                    )
+                } catch {
+                    print("⚠️ Error monitoring container exit: \(error)")
+                }
+            }
+            
+            // If attach is configured, set up live log monitoring asynchronously
             let attachConfig = ContainerAttachStore.shared.getAttachConfig(containerId: id)
-            let shouldAttachStdout = attachConfig?.attachStdout ?? false
-            let shouldAttachStderr = attachConfig?.attachStderr ?? false
-            let shouldAttachStdin = attachConfig?.attachStdin ?? false
+            if let attachConfig = attachConfig, (attachConfig.attachStdout || attachConfig.attachStderr) {
+                Task {
+                    await setupLiveLogMonitoring(
+                        containerId: id, 
+                        attachStdout: attachConfig.attachStdout,
+                        attachStderr: attachConfig.attachStderr
+                    )
+                }
+            }
             
-            // Create stdio pipes based on attach configuration
-            let stdinPipe = shouldAttachStdin ? Pipe() : nil
-            let stdoutPipe = shouldAttachStdout ? Pipe() : nil
-            let stderrPipe = shouldAttachStderr ? Pipe() : nil
+            return DockerAPIResponse(status: .noContent)
+        } catch {
+            return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to start container: \(error)"])
+        }
+    }
+    
+    private func setupLiveLogMonitoring(containerId: String, attachStdout: Bool, attachStderr: Bool) async {
+        print("🚀 Setting up live log monitoring for \(containerId)")
+        do {
+            // Give the container a moment to start and create log files
+            try await Task.sleep(for: .milliseconds(100))
             
-            // Make pipes non-blocking for real-time streaming
+            let container = try await ClientContainer.get(id: containerId)
+            let logHandles = try await container.logs()
+            print("📋 Got \(logHandles.count) log handles for \(containerId)")
+            
+            // Create pipes for attach functionality
+            let stdoutPipe = attachStdout ? Pipe() : nil
+            let stderrPipe = attachStderr ? Pipe() : nil
+            
+            // Make pipes non-blocking
             if let stdout = stdoutPipe {
                 let flags = fcntl(stdout.fileHandleForReading.fileDescriptor, F_GETFL)
                 _ = fcntl(stdout.fileHandleForReading.fileDescriptor, F_SETFL, flags | O_NONBLOCK)
@@ -86,29 +142,116 @@ extension DockerAPIHandler {
                 _ = fcntl(stderr.fileHandleForReading.fileDescriptor, F_SETFL, flags | O_NONBLOCK)
             }
             
-            // Store pipes for potential attach operations
-            if let stdout = stdoutPipe, let stderr = stderrPipe {
-                ContainerAttachStore.shared.setPipes(containerId: id, stdout: stdout, stderr: stderr)
+            // Store pipes for attach operations - this should notify waiting attach
+            if (stdoutPipe != nil || stderrPipe != nil) {
+                print("🔗 Storing pipes for \(containerId) to notify attach")
+                ContainerAttachStore.shared.setPipes(containerId: containerId, stdout: stdoutPipe, stderr: stderrPipe)
             }
             
-            let stdio: [FileHandle?] = [
-                stdinPipe?.fileHandleForReading,
-                stdoutPipe?.fileHandleForWriting,
-                stderrPipe?.fileHandleForWriting
-            ]
+            // Set up log file tailing for stdout
+            if attachStdout, let stdoutPipe = stdoutPipe, logHandles.indices.contains(0) {
+                let logFile = logHandles[0]
+                print("📡 Setting up stdout log tailer for \(containerId)")
+                setupLogTailer(
+                    containerId: containerId,
+                    streamType: "stdout",
+                    logFile: logFile,
+                    outputPipe: stdoutPipe.fileHandleForWriting
+                )
+            }
             
-            let proc = try await container.bootstrap(stdio: stdio)
-            try await proc.start()
+            // Set up log file tailing for stderr  
+            if attachStderr, let stderrPipe = stderrPipe, logHandles.indices.contains(1) {
+                let logFile = logHandles[1]
+                print("📡 Setting up stderr log tailer for \(containerId)")
+                setupLogTailer(
+                    containerId: containerId,
+                    streamType: "stderr", 
+                    logFile: logFile,
+                    outputPipe: stderrPipe.fileHandleForWriting
+                )
+            }
             
-            // For containers with stdout/stderr attached, we need to handle the output
-            // In Docker's behavior, when you run "docker run hello-world", the output
-            // is immediately streamed back. However, since this is just the start endpoint,
-            // we don't stream here. The output will be available via logs endpoint.
-            
-            return DockerAPIResponse(status: .noContent)
         } catch {
-            return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to start container: \(error)"])
+            print("⚠️ Failed to set up live log monitoring for \(containerId): \(error)")
         }
+    }
+    
+    private func setupLogTailer(
+        containerId: String,
+        streamType: String,
+        logFile: FileHandle,
+        outputPipe: FileHandle
+    ) {
+        // Move to end of log file to only capture new content
+        logFile.seekToEndOfFile()
+        
+        // Set up polling-based log file monitoring
+        let timer = DispatchSource.makeTimerSource(queue: DispatchQueue.global())
+        timer.schedule(deadline: .now(), repeating: .milliseconds(50)) // Poll every 50ms
+        
+        timer.setEventHandler {
+            let data = logFile.availableData
+            if !data.isEmpty {
+                outputPipe.write(data)
+                print("📡 Tailed \(data.count) bytes from \(streamType) log for \(containerId)")
+            }
+        }
+        
+        timer.setCancelHandler {
+            logFile.closeFile()
+            outputPipe.closeFile()
+        }
+        
+        timer.resume()
+        
+        // Store the timer so it doesn't get deallocated
+        ContainerAttachStore.shared.storeMuxSource(containerId: containerId, source: timer as! DispatchSourceRead)
+    }
+    
+    private func createTeePipe() -> (Pipe, FileHandle) {
+        let pipe = Pipe()
+        let outputHandle = pipe.fileHandleForWriting
+        return (pipe, outputHandle)
+    }
+    
+    private func setupTeeForwarder(
+        containerId: String,
+        streamType: String,
+        fromTee: Pipe,
+        toAttach: FileHandle,
+        toOutput: FileHandle
+    ) {
+        let source = DispatchSource.makeReadSource(
+            fileDescriptor: fromTee.fileHandleForReading.fileDescriptor,
+            queue: DispatchQueue.global()
+        )
+        
+        source.setEventHandler {
+            let data = fromTee.fileHandleForReading.availableData
+            if !data.isEmpty {
+                // Write to both attach pipe and the normal output (which goes to logs)
+                toAttach.write(data)
+                toOutput.write(data)
+                
+                print("� Teed \(data.count) bytes to \(streamType) for \(containerId)")
+            } else {
+                // EOF - close both outputs
+                toAttach.closeFile()
+                toOutput.closeFile()
+            }
+        }
+        
+        source.setCancelHandler {
+            fromTee.fileHandleForReading.closeFile()
+            toAttach.closeFile()
+            toOutput.closeFile()
+        }
+        
+        source.resume()
+        
+        // Store the source so it doesn't get deallocated
+        ContainerAttachStore.shared.storeMuxSource(containerId: containerId, source: source)
     }
     
     // POST /containers/{id}/stop
@@ -564,19 +707,48 @@ extension DockerAPIHandler {
     
     // GET /events
     func getEvents(query: [String: String]) async throws -> DockerAPIResponse {
-        // Provide a streaming response and keep the connection open to avoid EOF
-        // on clients that expect long polling for events.
-        let streamer: @Sendable (Channel) -> Void = { channel in
-            // Keep connection open and send chunked heartbeats
-            let task = channel.eventLoop.scheduleRepeatedTask(initialDelay: .seconds(30), delay: .seconds(30)) { _ in
-                var buf = channel.allocator.buffer(capacity: 1)
-                buf.writeString("\n")
-                let part = HTTPServerResponsePart.body(.byteBuffer(buf))
-                channel.writeAndFlush(part, promise: nil)
+        // Parse filters
+        var filters: [String: [String]] = [:]
+        if let filtersString = query["filters"] {
+            if let filtersData = filtersString.data(using: .utf8),
+               let decoded = try? JSONSerialization.jsonObject(with: filtersData) as? [String: [String]] {
+                filters = decoded
             }
-            channel.closeFuture.whenComplete { _ in task.cancel() }
         }
-        return DockerAPIResponse(status: .ok, body: nil, contentType: "application/json", streamer: streamer)
+        
+        // Parse time range
+        var since: Date?
+        var until: Date?
+        if let sinceString = query["since"] {
+            if let timestamp = Double(sinceString) {
+                since = Date(timeIntervalSince1970: timestamp)
+            }
+        }
+        if let untilString = query["until"] {
+            if let timestamp = Double(untilString) {
+                until = Date(timeIntervalSince1970: timestamp)
+            }
+        }
+        
+        let streamer: @Sendable (Channel) -> Void = { [filters, since, until] channel in
+            EventsStore.shared.subscribe(
+                channel: channel,
+                filters: filters,
+                since: since,
+                until: until
+            )
+        }
+        
+        return DockerAPIResponse(
+            status: .switchingProtocols, 
+            body: nil, 
+            contentType: "application/json",
+            additionalHeaders: [
+                ("Connection", "Upgrade"),
+                ("Upgrade", "tcp")
+            ],
+            streamer: streamer
+        )
     }
 
     // POST /images/create

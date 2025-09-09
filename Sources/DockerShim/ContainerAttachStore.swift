@@ -8,6 +8,7 @@ final class ContainerAttachStore: @unchecked Sendable {
     private var attachedContainers: [String: AttachedContainer] = [:]
     private var attachConfigs: [String: AttachConfig] = [:]
     private var pipeWaiters: [String: [CheckedContinuation<AttachedContainer?, Never>]] = [:]
+    private var muxSources: [String: [DispatchSourceRead]] = [:]
     
     private init() {}
     
@@ -80,6 +81,21 @@ final class ContainerAttachStore: @unchecked Sendable {
                     continuation.resume(returning: nil)
                 }
             }
+            // Cancel and remove multiplexer sources
+            if let sources = self?.muxSources.removeValue(forKey: containerId) {
+                for source in sources {
+                    source.cancel()
+                }
+            }
+        }
+    }
+    
+    func storeMuxSource(containerId: String, source: DispatchSourceRead) {
+        queue.async(flags: .barrier) { [weak self] in
+            if self?.muxSources[containerId] == nil {
+                self?.muxSources[containerId] = []
+            }
+            self?.muxSources[containerId]?.append(source)
         }
     }
     
