@@ -289,7 +289,7 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
             return DockerAPIResponse(status: .ok, body: "")
         
         case (.POST, ["auth"]):
-            return DockerAPIResponse(status: .ok, body: ["Status": "Login Succeeded"])
+            return DockerAPIResponse(status: .notImplemented, body: ["message": "Authentication not yet implemented"])
         
         case (.GET, ["system", "df"]):
             return getSystemUsage()
@@ -402,16 +402,23 @@ final class DockerAPIHandler: ChannelInboundHandler, @unchecked Sendable {
         if let streamer = response.streamer {
             let channel = context.channel
             if isUpgrade {
-                // Hijack connection for raw streaming
-                channel.pipeline.context(handlerType: HTTPResponseEncoder.self).whenSuccess { ctx in
-                    _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+                // Complete the HTTP upgrade handshake first
+                context.writeAndFlush(wrapOutboundOut(.end(nil))).whenComplete { result in
+                    // Then hijack connection for raw streaming after the upgrade is complete
+                    channel.pipeline.context(handlerType: HTTPResponseEncoder.self).whenSuccess { ctx in
+                        _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+                    }
+                    channel.pipeline.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self).whenSuccess { ctx in
+                        _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
+                    }
+                    // Now start the streamer - capture streamer locally
+                    let capturedStreamer = streamer
+                    capturedStreamer(channel)
                 }
-                channel.pipeline.context(handlerType: ByteToMessageHandler<HTTPRequestDecoder>.self).whenSuccess { ctx in
-                    _ = channel.pipeline.syncOperations.removeHandler(context: ctx)
-                }
+            } else {
+                // Run streamer directly for non-upgrade streaming
+                streamer(channel)
             }
-            // Run streamer directly
-            streamer(channel)
         } else if !isUpgrade {
             context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: nil)
         } else {
@@ -447,9 +454,9 @@ struct DockerAPIResponse: @unchecked Sendable {
     let body: Any?
     let contentType: String
     let additionalHeaders: [(String,String)]
-    let streamer: ((Channel) -> Void)?
+    let streamer: (@Sendable (Channel) -> Void)?
 
-    init(status: HTTPResponseStatus, body: Any? = nil, contentType: String = "application/json", additionalHeaders: [(String,String)] = [], streamer: ((Channel) -> Void)? = nil) {
+    init(status: HTTPResponseStatus, body: Any? = nil, contentType: String = "application/json", additionalHeaders: [(String,String)] = [], streamer: (@Sendable (Channel) -> Void)? = nil) {
         self.status = status
         self.body = body
         self.contentType = contentType

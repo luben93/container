@@ -22,17 +22,10 @@ extension DockerAPIHandler {
             }
             return DockerAPIResponse(status: .ok, body: dockerContainers)
         } catch {
-            // Check if this is an XPC connection error
-            let errorMessage = "\(error)"
-            if errorMessage.contains("XPC") || errorMessage.contains("Connection invalid") {
-                // Return a proper error message for XPC issues
-                return DockerAPIResponse(
-                    status: .internalServerError, 
-                    body: ["message": "Container runtime is not available. Please ensure the container system is running with: swift run container system start"]
-                )
-            }
-            // For other errors, return empty list to keep clients working
-            return DockerAPIResponse(status: .ok, body: [] as [[String: Any]])
+            return DockerAPIResponse(
+                status: .internalServerError, 
+                body: ["message": "Failed to list containers: \(error)"]
+            )
         }
     }
     
@@ -74,11 +67,6 @@ extension DockerAPIHandler {
             try await proc.start()
             return DockerAPIResponse(status: .noContent)
         } catch {
-            // If backend unavailable, pretend success so docker run flow can progress in shim mode.
-            let errStr = "\(error)"
-            if errStr.contains("XPC") || errStr.contains("Connection invalid") || errStr.contains("No such container") {
-                return DockerAPIResponse(status: .noContent, body: nil)
-            }
             return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to start container: \(error)"])
         }
     }
@@ -512,13 +500,13 @@ extension DockerAPIHandler {
     func getEvents(query: [String: String]) async throws -> DockerAPIResponse {
         // Provide a streaming response and keep the connection open to avoid EOF
         // on clients that expect long polling for events.
-        let streamer: (Channel) -> Void = { channel in
+        let streamer: @Sendable (Channel) -> Void = { channel in
             // Keep connection open and send chunked heartbeats
             let task = channel.eventLoop.scheduleRepeatedTask(initialDelay: .seconds(30), delay: .seconds(30)) { _ in
                 var buf = channel.allocator.buffer(capacity: 1)
                 buf.writeString("\n")
                 let part = HTTPServerResponsePart.body(.byteBuffer(buf))
-                channel.writeAndFlush(NIOAny(part), promise: nil)
+                channel.writeAndFlush(part, promise: nil)
             }
             channel.closeFuture.whenComplete { _ in task.cancel() }
         }
@@ -538,15 +526,7 @@ extension DockerAPIHandler {
             let msg = ["status": "Downloaded or up to date", "id": ref]
             return DockerAPIResponse(status: .ok, body: [msg])
         } catch {
-            let errorMessage = "\(error)"
-            if errorMessage.contains("XPC connection") || errorMessage.contains("Connection invalid") {
-                return DockerAPIResponse(
-                    status: .internalServerError, 
-                    body: ["message": "Failed to pull image: \(error)\n\nThe Apple Container runtime is not available. To use image operations, you need to:\n1. Start the container system: swift run container system start\n2. Ensure the API server is running\n3. Install required network plugins\n\nCurrently, only the Docker API compatibility layer is running."]
-                )
-            } else {
-                return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to pull image: \(error)"])
-            }
+            return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to pull image: \(error)"])
         }
     }
 
@@ -566,8 +546,7 @@ extension DockerAPIHandler {
             }
             return DockerAPIResponse(status: .ok, body: mapped)
         } catch {
-            // Return empty list if backend is unavailable
-            return DockerAPIResponse(status: .ok, body: [] as [[String: Any]])
+            return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to list images: \(error)"])
         }
     }
     
@@ -1096,23 +1075,25 @@ extension DockerAPIHandler {
     
     // Additional image endpoints
     func buildImage(head: HTTPRequestHead, body: ByteBuffer, query: [String: String]) async throws -> DockerAPIResponse {
-        // Placeholder build implementation: accept request and return friendly error via normal build output format.
-        // Docker expects newline-delimited JSON objects with at least a 'stream' or 'error' key.
-        let steps: [[String: Any]] = [
-            ["stream": "# Apple Container shim: build support not yet implemented\n"],
-            ["errorDetail": ["message": "Build not supported yet"], "error": "Build not supported yet"]
-        ]
-        return DockerAPIResponse(status: .ok, body: steps)
+        // TODO: Implement proper Docker build support using ContainerBuild
+        // For now, return a proper error instead of fake success
+        return DockerAPIResponse(
+            status: .notImplemented,
+            body: ["message": "Docker build is not yet implemented in this container runtime"]
+        )
     }
     
     func removeImage(name: String, query: [String: String]) async throws -> DockerAPIResponse {
-        // Try to resolve image; if found pretend it's untagged/deleted so clients proceed.
-        var actions: [[String: String]] = []
-        if (try? await ClientImage.get(reference: name)) != nil {
-            actions.append(["Untagged": name])
-            actions.append(["Deleted": "sha256:placeholder"]) // Placeholder digest
+        do {
+            try await ClientImage.delete(reference: name)
+            let actions: [[String: String]] = [
+                ["Untagged": name],
+                ["Deleted": "sha256:placeholder"] // Placeholder digest
+            ]
+            return DockerAPIResponse(status: .ok, body: actions)
+        } catch {
+            return DockerAPIResponse(status: .internalServerError, body: ["message": "Failed to remove image: \(error)"])
         }
-        return DockerAPIResponse(status: .ok, body: actions.isEmpty ? [] : actions)
     }
     
     func inspectImage(name: String) async throws -> DockerAPIResponse {
@@ -1171,7 +1152,7 @@ extension DockerAPIHandler {
         let stdoutPipe = Pipe()
         let stderrPipe = Pipe()
 
-        let streamer: (Channel) -> Void = { channel in
+        let streamer: @Sendable (Channel) -> Void = { channel in
             // Install inbound handler to forward bytes to stdin
             channel.pipeline.addHandler(ExecInboundHandler(writeHandle: stdinPipe.fileHandleForWriting)).whenComplete { _ in }
 
@@ -1207,7 +1188,7 @@ extension DockerAPIHandler {
                         buf.writeInteger(UInt8(0))
                         buf.writeInteger(UInt32(data.count).bigEndian)
                         buf.writeBytes(data)
-                        channel.writeAndFlush(NIOAny(buf), promise: nil)
+                        channel.writeAndFlush(buf, promise: nil)
                     }
 
                     // Readers using readabilityHandler for pipes
@@ -1251,18 +1232,10 @@ extension DockerAPIHandler {
         let attachStdout = query["stdout"] != "0"
         let attachStderr = query["stderr"] != "0"
         let wantLogs = (query["logs"] == "1" || query["logs"] == "true")
-        let follow = query["stream"] != "0" // follow/stream by default
+        let follow = query["stream"] != "0"
 
         guard let container = try? await ClientContainer.get(id: id) else {
             return DockerAPIResponse(status: .notFound, body: ["message": "No such container: \(id)"])
-        }
-
-        // Acquire log file handles (stdout, stderr)
-        let logHandles = try? await container.logs()
-        var initialStdout = Data(); var initialStderr = Data()
-        if wantLogs, let handles = logHandles {
-            if attachStdout, handles.indices.contains(0) { initialStdout = handles[0].readDataToEndOfFile() }
-            if attachStderr, handles.indices.contains(1) { initialStderr = handles[1].readDataToEndOfFile() }
         }
 
         let makeFrame: @Sendable (UInt8, Data) -> ByteBuffer = { streamType, payload in
@@ -1276,46 +1249,83 @@ extension DockerAPIHandler {
             return buf
         }
 
-        let streamer: (Channel) -> Void = { channel in
-            // Write any initial logs
-            if attachStdout && !initialStdout.isEmpty {
-                channel.write(NIOAny(makeFrame(1, initialStdout)), promise: nil)
-            }
-            if attachStderr && !initialStderr.isEmpty {
-                channel.write(NIOAny(makeFrame(2, initialStderr)), promise: nil)
-            }
-            channel.flush()
-
-            guard follow, let handles = logHandles else {
-                // No follow requested; close soon after delivering initial logs
-                channel.eventLoop.scheduleTask(in: .milliseconds(100)) { channel.close(promise: nil) }
-                return
-            }
-
-            // Follow mode: stream new bytes from log files
-            if attachStdout, handles.indices.contains(0) {
-                let fh = handles[0]
-                fh.readabilityHandler = { h in
-                    let data = h.availableData
-                    if data.isEmpty { h.readabilityHandler = nil; return }
-                    var buf = makeFrame(1, data)
-                    channel.writeAndFlush(NIOAny(buf), promise: nil)
+        let streamer: @Sendable (Channel) -> Void = { channel in
+            Task {
+                // Send existing logs if requested
+                if wantLogs {
+                    if let logHandles = try? await container.logs() {
+                        if attachStdout && logHandles.indices.contains(0) {
+                            let stdoutData = logHandles[0].readDataToEndOfFile()
+                            if !stdoutData.isEmpty {
+                                let frame = makeFrame(1, stdoutData)
+                                channel.writeAndFlush(frame, promise: nil)
+                            }
+                        }
+                        if attachStderr && logHandles.indices.contains(1) {
+                            let stderrData = logHandles[1].readDataToEndOfFile()
+                            if !stderrData.isEmpty {
+                                let frame = makeFrame(2, stderrData)
+                                channel.writeAndFlush(frame, promise: nil)
+                            }
+                        }
+                    }
                 }
-            }
-            if attachStderr, handles.indices.contains(1) {
-                let fh = handles[1]
-                fh.readabilityHandler = { h in
-                    let data = h.availableData
-                    if data.isEmpty { h.readabilityHandler = nil; return }
-                    var buf = makeFrame(2, data)
-                    channel.writeAndFlush(NIOAny(buf), promise: nil)
-                }
-            }
-
-            channel.closeFuture.whenComplete { _ in
-                // Cleanup handlers when client detaches
-                if let handles = logHandles {
-                    handles.forEach { $0.readabilityHandler = nil }
+                
+                if follow {
+                    // Set up polling for new log content
+                    var lastStdoutSize = 0
+                    var lastStderrSize = 0
+                    
+                    let pollTask = Task {
+                        while !Task.isCancelled {
+                            try await Task.sleep(for: .milliseconds(100))
+                            
+                            if let logHandles = try? await container.logs() {
+                                // Check for new stdout content
+                                if attachStdout && logHandles.indices.contains(0) {
+                                    let handle = logHandles[0]
+                                    handle.seek(toFileOffset: UInt64(lastStdoutSize))
+                                    let newData = handle.readDataToEndOfFile()
+                                    if !newData.isEmpty {
+                                        let frame = makeFrame(1, newData)
+                                        channel.writeAndFlush(frame, promise: nil)
+                                        lastStdoutSize += newData.count
+                                    }
+                                }
+                                
+                                // Check for new stderr content
+                                if attachStderr && logHandles.indices.contains(1) {
+                                    let handle = logHandles[1]
+                                    handle.seek(toFileOffset: UInt64(lastStderrSize))
+                                    let newData = handle.readDataToEndOfFile()
+                                    if !newData.isEmpty {
+                                        let frame = makeFrame(2, newData)
+                                        channel.writeAndFlush(frame, promise: nil)
+                                        lastStderrSize += newData.count
+                                    }
+                                }
+                            }
+                            
+                            // Check if container has stopped
+                            if let updatedContainer = try? await ClientContainer.get(id: id),
+                               updatedContainer.status != .running {
+                                // Container stopped, send final logs and close
+                                try await Task.sleep(for: .milliseconds(500))
+                                channel.close(promise: nil)
+                                break
+                            }
+                        }
+                    }
+                    
+                    // Cancel polling when channel closes
+                    channel.closeFuture.whenComplete { _ in
+                        pollTask.cancel()
+                    }
+                } else {
+                    // Not following, just close after sending existing logs
+                    channel.eventLoop.scheduleTask(in: .milliseconds(100)) {
+                        channel.close(promise: nil)
+                    }
                 }
             }
         }
